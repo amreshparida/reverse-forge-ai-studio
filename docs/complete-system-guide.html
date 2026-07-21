@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Reverse Engineering Studio — Intelligence Pipeline Guide</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --bg: #f4f1ea;
+      --paper: #fffcf7;
+      --ink: #1a1916;
+      --muted: #5f5b52;
+      --line: #d8d0c2;
+      --teal: #0d5c4d;
+      --teal-soft: #e4f1ed;
+      --amber: #9a5b12;
+      --amber-soft: #f6ebd8;
+      --rose: #8b2e2e;
+      --rose-soft: #f6e6e6;
+      --code: #1c2228;
+      --code-ink: #e7ece8;
+      --shadow: 0 12px 40px rgba(26, 25, 22, 0.07);
+      --font: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+      --nav: 300px;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: var(--font);
+      color: var(--ink);
+      background:
+        radial-gradient(900px 480px at 0% 0%, #e7f2ee 0%, transparent 55%),
+        radial-gradient(700px 420px at 100% 8%, #f2ebe0 0%, transparent 50%),
+        var(--bg);
+      line-height: 1.62;
+    }
+    a { color: var(--teal); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .shell { display: grid; grid-template-columns: var(--nav) minmax(0, 1fr); min-height: 100vh; }
+    nav {
+      position: sticky; top: 0; height: 100vh; overflow: auto;
+      padding: 1.2rem 1rem 2rem;
+      border-right: 1px solid var(--line);
+      background: rgba(255,252,247,0.92);
+    }
+    nav .brand { font-weight: 750; font-size: 0.95rem; }
+    nav .tag { color: var(--muted); font-size: 0.75rem; margin: 0.2rem 0 1rem; }
+    nav .g { margin-top: 0.9rem; padding: 0.25rem 0.5rem; font-size: 0.68rem; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--muted); }
+    nav a { display: block; padding: 0.32rem 0.5rem; border-radius: 8px; color: var(--ink); font-size: 0.82rem; }
+    nav a:hover { background: var(--teal-soft); text-decoration: none; }
+    main { padding: 1.75rem clamp(1rem, 3vw, 2.75rem) 3.5rem; max-width: 1000px; }
+    .hero {
+      background: var(--paper); border: 1px solid var(--line); border-radius: 18px;
+      padding: 1.75rem 1.8rem; box-shadow: var(--shadow); margin-bottom: 1.25rem;
+    }
+    .hero h1 { margin: 0 0 0.45rem; font-size: clamp(1.55rem, 2.8vw, 2.2rem); line-height: 1.2; }
+    .hero p { margin: 0; color: var(--muted); max-width: 70ch; }
+    .chips { display: flex; flex-wrap: wrap; gap: 0.45rem; margin-top: 1rem; }
+    .chip { font-size: 0.75rem; color: var(--muted); border: 1px solid var(--line); background: var(--bg); border-radius: 999px; padding: 0.22rem 0.6rem; }
+    section {
+      background: var(--paper); border: 1px solid var(--line); border-radius: 14px;
+      padding: 1.35rem 1.45rem 1.55rem; margin-bottom: 1rem; box-shadow: var(--shadow);
+    }
+    section h2 { margin: 0 0 0.75rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--line); font-size: 1.28rem; }
+    section h3 { margin: 1.25rem 0 0.45rem; font-size: 1.02rem; }
+    section h4 { margin: 0.95rem 0 0.35rem; font-size: 0.92rem; color: var(--teal); }
+    p { margin: 0.5rem 0; }
+    ul, ol { margin: 0.35rem 0 0.65rem; padding-left: 1.2rem; }
+    li { margin: 0.22rem 0; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.8rem; }
+    @media (max-width: 960px) {
+      .shell { grid-template-columns: 1fr; }
+      nav { position: relative; height: auto; max-height: 260px; border-right: 0; border-bottom: 1px solid var(--line); }
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+    .card { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 0.85rem 0.95rem; }
+    .card h4 { margin-top: 0; }
+    .callout { border-left: 4px solid var(--teal); background: var(--teal-soft); border-radius: 0 10px 10px 0; padding: 0.7rem 0.9rem; margin: 0.8rem 0; font-size: 0.92rem; }
+    .warn { border-left-color: var(--amber); background: var(--amber-soft); }
+    .danger { border-left-color: var(--rose); background: var(--rose-soft); }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; margin: 0.7rem 0 0.9rem; }
+    th, td { border: 1px solid var(--line); padding: 0.5rem 0.6rem; vertical-align: top; text-align: left; }
+    th { background: #efe8db; font-weight: 650; }
+    tr:nth-child(even) td { background: #fbf8f2; }
+    code { font-family: var(--mono); font-size: 0.86em; background: #efe8db; padding: 0.08rem 0.32rem; border-radius: 4px; }
+    .codeblock {
+      font-family: var(--mono); font-size: 0.78rem; line-height: 1.4;
+      background: var(--code); color: var(--code-ink);
+      padding: 0.9rem 1rem; border-radius: 10px; overflow: auto; white-space: pre; margin: 0.75rem 0;
+    }
+    .mermaid-wrap {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 1rem 0.75rem;
+      margin: 0.85rem 0 1rem;
+      overflow-x: auto;
+    }
+    .mermaid { display: flex; justify-content: center; }
+    .stage {
+      display: grid; grid-template-columns: 64px 1fr; gap: 0.7rem;
+      padding: 0.7rem 0; border-bottom: 1px dashed var(--line);
+    }
+    .stage:last-child { border-bottom: 0; }
+    .pct { font-weight: 750; color: var(--teal); }
+    .legend { display: flex; flex-wrap: wrap; gap: 0.55rem; margin: 0.5rem 0; }
+    .sw { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8rem; color: var(--muted); }
+    .dot { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+    #mermaid-status {
+      display: none; margin: 0 0 1rem; padding: 0.75rem 1rem;
+      border-radius: 10px; border: 1px solid #f0c2c2; background: #fff1f1; color: #7a1f1f; font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+<div class="shell">
+  <nav aria-label="Contents">
+    <div class="brand">Intelligence Pipeline</div>
+    <div class="tag">Crawls · Capture · Graph · AI orchestration</div>
+    <div class="g">Spine</div>
+    <a href="#overview">1. End-to-end spine</a>
+    <a href="#safety">2. Safety invariants</a>
+    <div class="g">Crawling</div>
+    <a href="#crawl-common">3. Shared crawl mechanics</a>
+    <a href="#bfs">4. BFS crawler</a>
+    <a href="#agentic">5. Agentic crawler</a>
+    <a href="#xpert">6. Xpert collaborative</a>
+    <div class="g">Evidence</div>
+    <a href="#capture">7. Capture model</a>
+    <a href="#page-ai">8. Page AI analysis</a>
+    <div class="g">Graph</div>
+    <a href="#graph-build">9. Analysis graph build</a>
+    <a href="#graph-enrich">10. Enrichment and citations</a>
+    <a href="#graph-chunks">11. Graph chunking</a>
+    <div class="g">Orchestration</div>
+    <a href="#workspace">12. Synthesis workspace</a>
+    <a href="#tools">13. Agent tools</a>
+    <a href="#stages">14. Generation stages</a>
+    <a href="#specialists">15. Specialist agents</a>
+    <a href="#expert">16. Expert chunking</a>
+    <a href="#report">17. Final report assembly</a>
+    <a href="#resilience">18. Resilience patterns</a>
+  </nav>
+
+  <main>
+    <div id="mermaid-status">
+      Mermaid failed to load (often when opening this file via <code>file://</code> with blocked CDN).
+      Serve the docs folder over HTTP, or allow network access, then refresh.
+    </div>
+
+    <header class="hero" id="overview">
+      <h1>Intelligence Pipeline — Deep System Guide</h1>
+      <p>
+        How the studio turns a live enterprise web app into reverse-engineering documentation:
+        three crawl strategies capture evidence; page AI labels each screen; a synthesis agent
+        builds models under coverage gates; an analysis graph is indexed and chunked for specialist
+        agents; expert analysis chunks the evidence package; the final report merges everything.
+      </p>
+      <div class="chips">
+        <span class="chip">Read-only crawls</span>
+        <span class="chip">Coverage-gated synthesis</span>
+        <span class="chip">Typed analysis graph</span>
+        <span class="chip">Six specialist personas</span>
+        <span class="chip">Expert chunk merge</span>
+      </div>
+    </header>
+
+    <section>
+      <h2>1. End-to-end spine</h2>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart LR
+  A[Login / SSO] --> B[Crawl<br/>BFS / Agentic / Xpert]
+  B --> C[Per-page capture]
+  C --> D[Page AI labels]
+  D --> E[Entity / Workflow / Permissions]
+  E --> F[Analysis graph]
+  F --> G[Specialists<br/>6 agents]
+  F --> H[Architecture + KG]
+  G --> I[Expert package<br/>chunk and merge]
+  H --> I
+  E --> I
+  I --> J[Final Markdown + PDF]
+        </div>
+      </div>
+      <p>Later stages are checkpointed. Synthesis stages cannot invent artifacts until required evidence is fully drained.</p>
+    </section>
+
+    <section id="safety">
+      <h2>2. Safety invariants</h2>
+      <p>Every crawl mode is a <strong>read-only observer</strong>. Unsafe controls are classified before click.</p>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TD
+  El[Interactive element] --> T{Text unsafe?}
+  T -->|yes| Block[Block / paint red]
+  T -->|no| U{URL / href unsafe?}
+  U -->|yes| Block
+  U -->|no| A{Agent action validator}
+  A -->|fail| Block
+  A -->|pass| Allow[Allowed for crawl / LLM]
+        </div>
+      </div>
+      <div class="grid-3">
+        <div class="card"><h4>Layer A — Text</h4><p>Delete, submit, approve, logout, pay, send… multi-language partial match.</p></div>
+        <div class="card"><h4>Layer B — URL</h4><p>Logout / SSO SLO, IdP discovery, session-end hrefs.</p></div>
+        <div class="card"><h4>Layer C — Act</h4><p>Action validators refuse unsafe agent actions; form submit blocked.</p></div>
+      </div>
+      <div class="legend">
+        <span class="sw"><span class="dot" style="background:#2563eb"></span>Nav</span>
+        <span class="sw"><span class="dot" style="background:#16a34a"></span>Fields</span>
+        <span class="sw"><span class="dot" style="background:#ea580c"></span>Safe buttons</span>
+        <span class="sw"><span class="dot" style="background:#9333ea"></span>Other UI</span>
+        <span class="sw"><span class="dot" style="background:#dc2626"></span>Unsafe — never clicked</span>
+      </div>
+    </section>
+
+    <section id="crawl-common">
+      <h2>3. Shared crawl mechanics</h2>
+      <h3>Login gate</h3>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TD
+  H[Headed Chromium] --> L[User completes SSO / MFA]
+  L --> D[Inject Done control]
+  D --> C[Click Done]
+  C --> S[Persist storage state + postLoginUrl]
+  S --> P[Crawl continues on same page]
+        </div>
+      </div>
+      <h3>Per-page write set</h3>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart LR
+  Page[Live page] --> V[Viewport + overlay shot]
+  Page --> F[Full-page clean shot]
+  Page --> X[Deep extract JSON]
+  Page --> J[JS intelligence]
+  Page --> N[Network XHR/fetch]
+  X --> DB[(PageCapture row)]
+  N --> DB2[(NetworkCall rows)]
+  V --> Disk[Durable files]
+  F --> Disk
+  X --> Disk
+  J --> Disk
+        </div>
+      </div>
+    </section>
+
+    <section id="bfs">
+      <h2>4. BFS crawler — depth-bounded link expansion</h2>
+      <p>Systematic breadth-first traversal of the navigation graph. Best for predictable menu/link coverage.</p>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TD
+  Start([Start BFS crawl]) --> Init[queue = postLoginUrl at depth 0<br/>visited = empty]
+  Init --> Check{queue empty?}
+  Check -->|yes| SessionEnd[Session-end advanced captures<br/>OpenAPI / GraphQL / WebSocket / SSE]
+  SessionEnd --> Done([Crawl complete])
+  Check -->|no| Dequeue[Dequeue url, depth]
+  Dequeue --> Skip{url visited OR<br/>depth greater than crawlDepth?}
+  Skip -->|yes| Check
+  Skip -->|no| Visit[Mark visited]
+  Visit --> Nav[goto url unless already there<br/>networkidle then auto-scroll]
+  Nav --> Shots[observe + overlay = viewport shot<br/>remove overlay = full-page shot]
+  Shots --> Extract[extractPageData<br/>forms / tables / nav / modals]
+  Extract --> Safe[optional exploreSafeInteractions<br/>up to 10 safe clicks]
+  Safe --> Intel[extractJsIntelligence<br/>+ advanced page captures]
+  Intel --> Net[flush network calls for this page]
+  Net --> Links[discoverLinks<br/>hrefs + interaction URLs]
+  Links --> Enq[for each safe new link<br/>enqueue at depth + 1]
+  Enq --> Check
+        </div>
+      </div>
+      <div class="callout">Depth is hard-capped by project <code>crawlDepth</code>. Unsafe URLs never enter the queue.</div>
+    </section>
+
+    <section id="agentic">
+      <h2>5. Agentic crawler — observe → plan → act → validate</h2>
+      <p>LLM-driven exploration for tabs, panels, and dynamic UI that BFS link graphs miss. Loop budget defaults to <strong>150</strong> steps.</p>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TD
+  Start([Start agentic crawl]) --> Loop[Observe PageState]
+  Loop --> NewURL{URL new?}
+  NewURL -->|yes| Cap[Capture page<br/>shots HTML extract DB network]
+  NewURL -->|no| PlanCheck
+  Cap --> PlanCheck{Every 15 steps<br/>and pages >= 3?}
+  PlanCheck -->|yes| Plan[Planner LLM<br/>coverageEstimate]
+  Plan --> Cov{coverage >= 0.90?}
+  Cov -->|yes| Stop([Stop])
+  Cov -->|no| Nav
+  PlanCheck -->|no| Nav[Navigator LLM<br/>vision overlay preferred]
+  Nav --> Val[validateAction safety]
+  Val --> Act[executeAction Playwright]
+  Act --> Post[Post-action validate<br/>optional backtrack]
+  Post --> StopCheck{max steps OR<br/>3x done OR nav exhausted?}
+  StopCheck -->|no| Loop
+  StopCheck -->|yes| Stop
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <h4>Action vocabulary</h4>
+          <p><code>click</code>, <code>navigate</code>, <code>input</code>, <code>select</code>, <code>send_keys</code>, <code>scroll</code>, <code>scroll_to_text</code>, <code>scroll_to_percent</code>, <code>open_tab</code>, <code>switch_tab</code>, <code>close_tab</code>, <code>back</code>, <code>done</code></p>
+        </div>
+        <div class="card">
+          <h4>Stop conditions</h4>
+          <ul>
+            <li>Max steps (default 150)</li>
+            <li>Planner coverage ≥ 90%</li>
+            <li>3 consecutive <code>done</code> with no unvisited nav</li>
+            <li>Abort / all nav explored</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="xpert">
+      <h2>6. Xpert crawler — collaborative BFS + LLM</h2>
+      <p>One browser context, <strong>two tabs</strong>, shared queue and knowledge base.</p>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TB
+  subgraph Shared[SharedCrawlState]
+    Q[urlQueue]
+    V[visited / inProgress]
+    K[pageKnowledge / discovered*]
+    F[bfsDone / llmDone / stats]
+  end
+
+  Shared --> BFS
+  Shared --> LLM
+
+  subgraph BFS[Tab BFS]
+    B1[Prefer non-deep URLs]
+    B2[Capture + discover links]
+    B3[Flag tabs/accordions needsDeep]
+    B1 --> B2 --> B3
+  end
+
+  subgraph LLM[Tab LLM delayed 3s]
+    L1[Prefer needsDeep URLs]
+    L2[deepExplore up to 8 tabs / 5 accordions]
+    L3[or observe-act-validate]
+    L4[Planner every 12 pages]
+    L1 --> L2 --> L3 --> L4
+  end
+
+  B3 --> Q
+  L2 --> Q
+  BFS --> Done{queue empty and<br/>no in-progress and<br/>bfsDone or llmDone?}
+  LLM --> Done
+  Done -->|yes| End([Collaborative crawl complete])
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>Policy</th><th>Behavior</th></tr></thead>
+        <tbody>
+          <tr><td>Claim preference</td><td>LLM takes <code>needsDeep</code> first; BFS takes non-deep first; each falls back</td></tr>
+          <tr><td>BFS idle exit</td><td>No claim and (llmDone or idleCount &gt; 10)</td></tr>
+          <tr><td>LLM idle exit</td><td>bfsDone + idle, or consecutiveDones ≥ 5 with empty queue and bfsDone</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="capture">
+      <h2>7. Capture model — what evidence is</h2>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TB
+  P[Live page] --> S[Structure<br/>forms tables nav modals]
+  P --> C[Content<br/>text headings breadcrumbs]
+  P --> I[Intelligence<br/>tech stack JS routes store]
+  P --> N[Network<br/>XHR fetch GraphQL flags]
+  P --> V[Visual<br/>screenshots overlays]
+  S --> E[ComprehensivePageData]
+  C --> E
+  I --> E
+  N --> E
+  V --> E
+  E --> Disk[Durable JSON / HTML / PNG]
+  E --> DB[(PageCapture + NetworkCall)]
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>Evidence</th><th>Durable files</th><th>Database</th></tr></thead>
+        <tbody>
+          <tr><td>Screenshots / HTML / page JSON</td><td>Yes</td><td>Paths + truncated HTML/text + extractedData</td></tr>
+          <tr><td>Network calls</td><td>Per-page API JSON</td><td>NetworkCall rows masked</td></tr>
+          <tr><td>OpenAPI / GraphQL / WS / IndexedDB</td><td>Session/page artifacts</td><td>Not first-class tables</td></tr>
+          <tr><td>Page AI labels</td><td>Workspace indexes</td><td><code>PageCapture.aiAnalysis</code></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="page-ai">
+      <h2>8. Page AI analysis</h2>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TD
+  Pages[PageCapture rows] --> Has{has extractedData?}
+  Has -->|no| Skip[Skip]
+  Has -->|yes| AI{aiAnalysis exists?}
+  AI -->|yes| Skip
+  AI -->|no| Prompt[buildPageAnalysisPrompt]
+  Prompt --> LLM[LLM JSON schema]
+  LLM --> Save[Persist aiAnalysis]
+  Save --> Optional[Optional visual pass<br/>screenshot merge]
+        </div>
+      </div>
+      <p>Outputs include <code>businessModule</code>, <code>primaryEntity</code>, <code>relatedEntities</code>, <code>pagePurpose</code>, <code>workflowStage</code>, <code>possibleRoles</code>, <code>businessRules</code>, relationships, confidence.</p>
+    </section>
+
+    <section id="graph-build">
+      <h2>9. Analysis graph building</h2>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TD
+  Reset[Reset graph for session] --> Proj[PROJECT node]
+  Proj --> Art[RAW_ARTIFACT nodes<br/>from session files]
+  Proj --> Pages
+
+  subgraph Pages[For each page]
+    PG[PAGE]
+    PG --> M[MODULE / FEATURE]
+    PG --> UI[FORM FIELD TABLE COLUMN MODAL]
+    PG --> API[API_ENDPOINT API_CALL<br/>REQUEST_PAYLOAD RESPONSE_BODY]
+  end
+
+  Pages --> Models
+  subgraph Models[From inferred models]
+    EN[ENTITY + fields]
+    WF[WORKFLOW]
+    RL[ROLE + PERMISSION]
+  end
+
+  Models --> Gap[Gap-validator findings]
+  Gap --> Snap[analysis-graph.json<br/>nodes edges findings]
+        </div>
+      </div>
+      <div class="grid-3">
+        <div class="card"><h4>Project and pages</h4><p>PROJECT, PAGE, RAW_ARTIFACT</p></div>
+        <div class="card"><h4>UI structure</h4><p>MODULE, FEATURE, FORM, FIELD, TABLE, COLUMN, MODAL</p></div>
+        <div class="card"><h4>API and business</h4><p>API_*, ENTITY, WORKFLOW, ROLE, PERMISSION</p></div>
+      </div>
+    </section>
+
+    <section id="graph-enrich">
+      <h2>10. Graph enrichment, citations, coverage</h2>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart LR
+  G[analysis-graph] --> D[Dedupe findings]
+  D --> C[Citation map<br/>node to evidence]
+  C --> S[Coverage score 0-100]
+  S --> V[Validators<br/>score / orphans / missing links]
+  V --> Out[enriched graph<br/>citation map<br/>coverage json<br/>dedupe summary]
+        </div>
+      </div>
+      <p>Weighted coverage: extracted pages 0.15, AI pages 0.20, API responses 0.15, findings-with-evidence 0.25, connected nodes 0.25.</p>
+    </section>
+
+    <section id="graph-chunks">
+      <h2>11. Graph chunking strategy</h2>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TD
+  Snap[analysis-graph JSON string] --> Slice[Contiguous char windows]
+  Slice --> C1[chunk-001]
+  Slice --> C2[chunk-002]
+  Slice --> CN[chunk-N]
+  C1 --> Agent[Specialist agent]
+  C2 --> Agent
+  CN --> Agent
+  Agent --> Cov{all chunks read?}
+  Cov -->|no| ReadMore[read_next_unread_graph_chunks]
+  ReadMore --> Agent
+  Cov -->|yes| Write[write_artifact findings]
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>Path</th><th>Chunk size</th></tr></thead>
+        <tbody>
+          <tr><td>Synthesis specialist workspace</td><td><strong>200,000</strong> chars</td></tr>
+          <tr><td>Default materialize / legacy</td><td>80,000 chars</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="workspace">
+      <h2>12. Synthesis workspace and coverage gates</h2>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TB
+  subgraph WS[Synthesis workspace]
+    PA[page-analyses + index]
+    NC[network-calls + index]
+    GC[graph-chunks]
+    WN[working-notes.json]
+    CS[coverage-state.json]
+  end
+
+  PA --> Gate{get_coverage.complete?}
+  NC --> Gate
+  GC --> Gate
+  WN --> Gate
+  Gate -->|no| Drain[read_next_unread_*]
+  Drain --> Gate
+  Gate -->|yes| WA[write_artifact allowed]
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>Task</th><th>Pages</th><th>APIs</th><th>Graph chunks</th></tr></thead>
+        <tbody>
+          <tr><td>entity / workflow / permission</td><td>ALL</td><td>—</td><td>—</td></tr>
+          <tr><td>architecture</td><td>ALL</td><td>ALL</td><td>—</td></tr>
+          <tr><td>knowledge-graph</td><td>ALL reuse OK</td><td>not required</td><td>—</td></tr>
+          <tr><td>specialist</td><td>—</td><td>—</td><td>ALL</td></tr>
+        </tbody>
+      </table>
+      <div class="danger"><code>write_artifact</code> is rejected until coverage is complete.</div>
+    </section>
+
+    <section id="tools">
+      <h2>13. Synthesis agent tools and control loop</h2>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TD
+  Start[Start task] --> Turn[LLM tool turn]
+  Turn --> Tools[Execute tools]
+  Tools --> Cov[Update coverage-state]
+  Cov --> Stall{stall >= 3 and<br/>incomplete?}
+  Stall -->|yes| Auto[Auto-drain unread]
+  Auto --> Turn
+  Stall -->|no| Wrote{wrote valid artifact?}
+  Wrote -->|yes| Done([Return artifact])
+  Wrote -->|no| Budget{over step budget?}
+  Budget -->|yes| Ext[Extend budget]
+  Ext --> Turn
+  Budget -->|no| Turn
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>Tool</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td><code>get_coverage</code></td><td>Unread counts; complete flag</td></tr>
+          <tr><td><code>list_page_analyses</code> / <code>list_network_calls</code> / <code>list_graph_chunks</code></td><td>Catalogs</td></tr>
+          <tr><td><code>read_next_unread_pages</code></td><td>Drain pages default 16 max 20</td></tr>
+          <tr><td><code>read_next_unread_apis</code></td><td>Drain APIs default 25 max 50</td></tr>
+          <tr><td><code>read_next_unread_graph_chunks</code></td><td>Drain graph default 10 max 20</td></tr>
+          <tr><td><code>append_working_notes</code> / <code>read_working_notes</code></td><td>Cross-stage memory</td></tr>
+          <tr><td><code>read_artifact</code> / <code>write_artifact</code></td><td>Prior models in; validated JSON out</td></tr>
+        </tbody>
+      </table>
+      <h3>Knowledge-graph scaffold merge</h3>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart LR
+  Idx[Page + API + entity indexes] --> Scaf[Structural scaffold<br/>page entity api module nodes]
+  LLM[LLM compact enrichment<br/>edges modules summary] --> Merge[mergeKnowledgeGraph]
+  Scaf --> Merge
+  Merge --> OK{valid nodes+edges?}
+  OK -->|yes| Art[knowledge-graph.json]
+  OK -->|no| Salvage[Auto-salvage scaffold]
+  Salvage --> Art
+        </div>
+      </div>
+    </section>
+
+    <section id="stages">
+      <h2>14. Generation stage orchestration</h2>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TD
+  S1[12% page-analysis] --> S2[28% entity-inference]
+  S2 --> S3[42% workflow-inference]
+  S3 --> S4[52% permission-inference]
+  S4 --> S5[62% graph-indexing]
+  S5 --> S6[72% specialist-agents]
+  S6 --> S7[80% architecture-and-kg]
+  S7 --> S8[92% expert-analysis]
+  S8 --> S9[100% final-report]
+        </div>
+      </div>
+      <div class="stage"><div class="pct">12%</div><div><strong>page-analysis</strong> — fill missing aiAnalysis</div></div>
+      <div class="stage"><div class="pct">28%</div><div><strong>entity-inference</strong> — seeds shared notes</div></div>
+      <div class="stage"><div class="pct">42%</div><div><strong>workflow-inference</strong> — reuse notes</div></div>
+      <div class="stage"><div class="pct">52%</div><div><strong>permission-inference</strong> — reuse notes</div></div>
+      <div class="stage"><div class="pct">62%</div><div><strong>graph-indexing</strong> — typed graph snapshot</div></div>
+      <div class="stage"><div class="pct">72%</div><div><strong>specialist-agents</strong> — six agents on chunks</div></div>
+      <div class="stage"><div class="pct">80%</div><div><strong>architecture-and-kg</strong> — architecture + knowledge graph</div></div>
+      <div class="stage"><div class="pct">92%</div><div><strong>expert-analysis</strong> — evidence chunk/merge</div></div>
+      <div class="stage"><div class="pct">100%</div><div><strong>final-report</strong> — Markdown + PDF</div></div>
+    </section>
+
+    <section id="specialists">
+      <h2>15. Specialist agent orchestra</h2>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TB
+  Graph[Shared graph workspace] --> UX[ui-ux-agent]
+  Graph --> API[api-integration-agent]
+  Graph --> Data[data-engineer-agent]
+  Graph --> Dom[domain-product-agent]
+  Graph --> Sec[security-compliance-agent]
+  Graph --> Arch[solution-architect-agent]
+  UX --> F[Findings store]
+  API --> F
+  Data --> F
+  Dom --> F
+  Sec --> F
+  Arch --> F
+  F --> Report[Final report + expert package]
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>Agent</th><th>Persona</th><th>Focus</th></tr></thead>
+        <tbody>
+          <tr><td><code>ui-ux-agent</code></td><td>Senior UI/UX engineer</td><td>Screens, nav, forms, journeys</td></tr>
+          <tr><td><code>api-integration-agent</code></td><td>API / integration engineer</td><td>Endpoints, payloads, auth risk</td></tr>
+          <tr><td><code>data-engineer-agent</code></td><td>Data / DB architect</td><td>Entities, lineage, quality</td></tr>
+          <tr><td><code>domain-product-agent</code></td><td>Product / domain expert</td><td>Modules, personas, rules</td></tr>
+          <tr><td><code>security-compliance-agent</code></td><td>Security reviewer</td><td>Permissions, sensitive data</td></tr>
+          <tr><td><code>solution-architect-agent</code></td><td>Solution architect</td><td>Boundaries, debt, modernization</td></tr>
+        </tbody>
+      </table>
+      <div class="codeblock">{
+  "findings": [{
+    "category": "domain|product|architecture|data|api|security|workflow|ux|operations|gap",
+    "severity": "critical|high|medium|low",
+    "title": "...",
+    "detail": "...",
+    "evidenceNodeIds": ["..."],
+    "recommendation": "...",
+    "confidence": 0.0
+  }]
+}</div>
+    </section>
+
+    <section id="expert">
+      <h2>16. Expert evidence package and chunking</h2>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TD
+  Pack[Build evidence package<br/>AI pages + APIs + findings + models] --> Size[chunkSize = 60k]
+  Size --> Slice[Slice JSON string]
+  Slice --> Fit{chunks > 32?}
+  Fit -->|yes| Grow[Increase chunkSize up to 200k]
+  Grow --> Slice
+  Fit -->|no| Each[For each chunk<br/>expert extraction agent]
+  Each --> Cache[Cache chunk JSON on disk]
+  Cache --> Merge[Final board merge<br/>architect + SWE + data + security + product...]
+  Merge --> Out[expert-analysis.json]
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <h4>Included</h4>
+          <ul>
+            <li>Pages with aiAnalysis not raw HTML</li>
+            <li>Up to 400 API rows truncated ~800 chars</li>
+            <li>Up to 200 specialist findings</li>
+            <li>Artifact metadata/hashes</li>
+            <li>Inferred models + completeness audit</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h4>Excluded</h4>
+          <ul>
+            <li>Raw HTML / screenshot binaries</li>
+            <li>Full artifact bodies</li>
+            <li>Full multi-MB analysis graph</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="report">
+      <h2>17. Final report assembly</h2>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart LR
+  M[Models] --> W[Report writer]
+  A[Architecture + KG] --> W
+  S[Specialist findings] --> W
+  E[Expert analysis] --> W
+  C[Coverage + citations] --> W
+  P[Page inventory] --> W
+  W --> MD[final-report.md]
+  W --> PDF[final-report.pdf]
+  W --> Side[JSON / CSV sidecars]
+        </div>
+      </div>
+      <p>Assembles executive summary, modules, Mermaid ER/state diagrams, permissions, architecture, specialist findings, expert sections, and recommendations.</p>
+    </section>
+
+    <section id="resilience">
+      <h2>18. Resilience patterns</h2>
+      <div class="mermaid-wrap">
+        <div class="mermaid">
+flowchart TD
+  Fail[Transient failure 429 / timeout] --> Retry[retryUntilSuccess backoff]
+  Retry --> Ok{success?}
+  Ok -->|no| Retry
+  Ok -->|yes| Cont[Continue pipeline]
+  Stall[Model stall] --> Drain[Auto-drain unread]
+  Drain --> Cont
+  KGFail[KG write rejects] --> Salvage[Scaffold salvage]
+  Salvage --> Cont
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>Layer</th><th>Strategy</th></tr></thead>
+        <tbody>
+          <tr><td>Page AI</td><td>Finite retry; transient re-queue; permanent skip</td></tr>
+          <tr><td>Synthesis / specialists / expert</td><td>Unbounded backoff on transport/rate-limit</td></tr>
+          <tr><td>Synthesis control loop</td><td>Auto-drain; extend step budget; KG salvage</td></tr>
+          <tr><td>Checkpoint</td><td>Resume skips completed stages; expert chunks cached</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+</div>
+
+<script>
+  (function () {
+    var statusEl = document.getElementById('mermaid-status');
+    if (typeof mermaid === 'undefined') {
+      if (statusEl) statusEl.style.display = 'block';
+      return;
+    }
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'base',
+      securityLevel: 'loose',
+      flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+      themeVariables: {
+        fontFamily: 'Segoe UI, Helvetica Neue, Arial, sans-serif',
+        fontSize: '14px',
+        primaryColor: '#e4f1ed',
+        primaryTextColor: '#1a1916',
+        primaryBorderColor: '#0d5c4d',
+        lineColor: '#5f5b52',
+        secondaryColor: '#f6ebd8',
+        tertiaryColor: '#fffcf7',
+      },
+    });
+    mermaid.run({ querySelector: '.mermaid' }).catch(function (err) {
+      console.error(err);
+      if (statusEl) {
+        statusEl.style.display = 'block';
+        statusEl.textContent = 'Mermaid loaded but failed to render: ' + (err && err.message ? err.message : String(err));
+      }
+    });
+  })();
+</script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+node_modules/
+backend/node_modules/
+backend/dist/
+backend/dev.db
+backend/dev.db-journal
+backend/project-output/
+backend/sessions/
+backend/logs/
+backend/.env
+frontend/node_modules/
+frontend/dist/
+# Stale dirs that may have been created at root before the path fix
+project-output/
+sessions/
+logs/
+.DS_Store
+*.tsbuildinfo
+coverage/

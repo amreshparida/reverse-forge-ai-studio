@@ -1,0 +1,36 @@
+version: '3.9'
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    container_name: re-ai-studio
+    ports:
+      - "3001:3001"
+    volumes:
+      - re_ai_db:/app/backend/dev.db
+      - re_ai_output:/app/backend/project-output
+      - re_ai_sessions:/app/backend/sessions
+    environment:
+      DATABASE_URL: "file:./dev.db"
+      PORT: 3001
+      OUTPUT_DIR: /app/project-output
+      SESSION_DIR: /app/sessions
+      NODE_ENV: production
+      # Set these for AI analysis:
+      # LLM_BASE_URL: https://api.openai.com/v1
+      # LLM_API_KEY: sk-...
+      # LLM_MODEL: gpt-4o-mini
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  re_ai_db:
+  re_ai_output:
+  re_ai_sessions:

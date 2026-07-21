@@ -1,0 +1,194 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Project {
+  id                    String   @id @default(uuid())
+  name                  String
+  slug                  String   @unique
+  baseUrl               String
+  loginUrl              String?
+  loginRequired         Boolean  @default(false)
+  crawlDepth            Int      @default(3)
+  allowedDomains        String   @default("[]")
+  excludedUrls          String   @default("[]")
+  screenshotEnabled     Boolean  @default(true)
+  networkCaptureEnabled Boolean  @default(true)
+  aiEnabled             Boolean  @default(false)
+  llmBaseUrl            String?
+  llmApiKey             String?
+  llmModel              String?
+  safeClickSelectors    String   @default("[]")
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  crawlSessions CrawlSession[]
+  reports       Report[]
+}
+
+model CrawlSession {
+  id           String    @id @default(uuid())
+  projectId    String
+  project      Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  status       String    @default("pending")
+  startedAt    DateTime?
+  finishedAt   DateTime?
+  errorMessage String?
+  pagesCount   Int       @default(0)
+  createdAt    DateTime  @default(now())
+
+  pages        PageCapture[]
+  networkCalls NetworkCall[]
+  reports      Report[]
+  analysisNodes AnalysisGraphNode[]
+  analysisEdges AnalysisGraphEdge[]
+  analysisFindings AnalysisFinding[]
+}
+
+model PageCapture {
+  id                 String   @id @default(uuid())
+  crawlSessionId     String
+  crawlSession       CrawlSession @relation(fields: [crawlSessionId], references: [id], onDelete: Cascade)
+  url                String
+  title              String?
+  breadcrumbs        String?
+  html               String?
+  visibleText        String?
+  screenshotPath     String?
+  fullScreenshotPath String?
+  accessibilityTree  String?
+  extractedData      String?
+  aiAnalysis         String?
+  depth              Int      @default(0)
+  loadTimeMs         Float?
+  createdAt          DateTime @default(now())
+
+  networkCalls NetworkCall[]
+}
+
+model NetworkCall {
+  id                  String   @id @default(uuid())
+  crawlSessionId      String
+  crawlSession        CrawlSession @relation(fields: [crawlSessionId], references: [id], onDelete: Cascade)
+  pageCaptureId       String?
+  pageCapture         PageCapture? @relation(fields: [pageCaptureId], references: [id], onDelete: SetNull)
+  method              String?
+  url                 String
+  queryParams         String?
+  requestPayload      String?
+  requestContentType  String?
+  responseStatus      Int?
+  responseBody        String?
+  responseContentType String?
+  responseSchemaKeys  String?
+  requestHeaders      String?
+  responseHeaders     String?
+  timingMs            Float?
+  resourceType        String?
+  isGraphQL           Boolean  @default(false)
+  graphQLOperationName String?
+  createdAt           DateTime @default(now())
+}
+
+model EntityModel {
+  id            String   @id @default(uuid())
+  projectId     String
+  name          String
+  fields        String
+  relationships String
+  source        String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model WorkflowModel {
+  id         String   @id @default(uuid())
+  projectId  String
+  name       String
+  entityName String?
+  states     String
+  transitions String
+  actors     String?
+  source     String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Report {
+  id             String   @id @default(uuid())
+  projectId      String
+  project        Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  crawlSessionId String?
+  crawlSession   CrawlSession? @relation(fields: [crawlSessionId], references: [id], onDelete: SetNull)
+  type           String
+  filePath       String
+  createdAt      DateTime @default(now())
+}
+
+model AnalysisGraphNode {
+  id             String   @id @default(uuid())
+  projectId      String
+  crawlSessionId String
+  crawlSession   CrawlSession @relation(fields: [crawlSessionId], references: [id], onDelete: Cascade)
+  kind           String
+  key            String
+  label          String
+  properties     String
+  source         String?
+  confidence     Float?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([crawlSessionId, kind, key])
+  @@index([projectId])
+  @@index([crawlSessionId])
+  @@index([kind])
+}
+
+model AnalysisGraphEdge {
+  id             String   @id @default(uuid())
+  projectId      String
+  crawlSessionId String
+  crawlSession   CrawlSession @relation(fields: [crawlSessionId], references: [id], onDelete: Cascade)
+  fromNodeId     String
+  toNodeId       String
+  kind           String
+  label          String?
+  properties     String?
+  source         String?
+  confidence     Float?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([crawlSessionId, fromNodeId, toNodeId, kind])
+  @@index([projectId])
+  @@index([crawlSessionId])
+  @@index([kind])
+}
+
+model AnalysisFinding {
+  id             String   @id @default(uuid())
+  projectId      String
+  crawlSessionId String
+  crawlSession   CrawlSession @relation(fields: [crawlSessionId], references: [id], onDelete: Cascade)
+  agent          String
+  category       String
+  severity       String?
+  title          String
+  detail         String
+  evidenceNodeIds String?
+  recommendation String?
+  confidence     Float?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([crawlSessionId])
+  @@index([agent])
+  @@index([category])
+}
