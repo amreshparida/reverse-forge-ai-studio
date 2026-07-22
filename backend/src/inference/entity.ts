@@ -151,10 +151,9 @@ export function normalizeEntityModel(raw: EntityModel | Record<string, unknown>)
   const root = (raw ?? {}) as Record<string, unknown>;
   const list = Array.isArray(root['entities']) ? (root['entities'] as Record<string, unknown>[]) : [];
 
-  const entities: Entity[] = list
-    .map((item) => {
+  const entities: Entity[] = list.flatMap((item) => {
       const name = String(item['name'] ?? '').trim();
-      if (!name) return null;
+      if (!name) return [];
 
       const rawFields = Array.isArray(item['fields'])
         ? item['fields']
@@ -179,8 +178,7 @@ export function normalizeEntityModel(raw: EntityModel | Record<string, unknown>)
       }));
 
       const rawRels = Array.isArray(item['relationships']) ? (item['relationships'] as Record<string, unknown>[]) : [];
-      const relationships: EntityRelationship[] = rawRels
-        .map((r) => {
+      const relationships: EntityRelationship[] = rawRels.flatMap((r) => {
           const type = String(r['type'] ?? 'belongsTo') as EntityRelationship['type'];
           const entity =
             typeof r['entity'] === 'string'
@@ -190,18 +188,19 @@ export function normalizeEntityModel(raw: EntityModel | Record<string, unknown>)
                 : typeof r['target'] === 'string'
                   ? r['target']
                   : '';
-          if (!entity) return null;
-          return {
-            type: ['hasMany', 'belongsTo', 'belongsToMany', 'hasOne'].includes(type) ? type : 'belongsTo',
+          if (!entity) return [];
+          return [{
+            type: (['hasMany', 'belongsTo', 'belongsToMany', 'hasOne'].includes(type)
+              ? type
+              : 'belongsTo') as EntityRelationship['type'],
             entity,
             foreignKey: typeof r['foreignKey'] === 'string' ? r['foreignKey'] : undefined,
             through: typeof r['through'] === 'string' ? r['through'] : undefined,
-          } satisfies EntityRelationship;
-        })
-        .filter((r): r is EntityRelationship => r != null);
+          }];
+        });
 
       const statusField = fields.find((f) => /status/i.test(f.name));
-      return {
+      return [{
         name,
         pluralName: String(item['pluralName'] ?? `${name}s`),
         description: String(item['description'] ?? ''),
@@ -218,9 +217,8 @@ export function normalizeEntityModel(raw: EntityModel | Record<string, unknown>)
         isLookup: Boolean(item['isLookup']),
         estimatedRecordCount:
           typeof item['estimatedRecordCount'] === 'string' ? item['estimatedRecordCount'] : undefined,
-      } satisfies Entity;
-    })
-    .filter((e): e is Entity => e != null);
+      }];
+    });
 
   return { entities };
 }

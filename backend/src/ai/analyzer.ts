@@ -277,8 +277,8 @@ export async function inferArchitecture(
   if (config.llm.synthesisAgentEnabled) {
     return retryUntilSuccess(
       async () => {
-        const { materializeEvidenceWorkspace } = await import('./synthesis-workspace');
-        const { runSynthesisAgent } = await import('./synthesis-agent');
+        const { materializeEvidenceWorkspace } = await import('./synthesis-workspace.js');
+        const { runSynthesisAgent } = await import('./synthesis-agent.js');
 
         const workspace = await materializeEvidenceWorkspace({
           projectId: session.projectId,
@@ -421,8 +421,8 @@ export async function buildKnowledgeGraph(
         });
         if (!session) throw new Error('Session not found for knowledge graph workspace');
 
-        const { materializeEvidenceWorkspace } = await import('./synthesis-workspace');
-        const { runSynthesisAgent } = await import('./synthesis-agent');
+        const { materializeEvidenceWorkspace } = await import('./synthesis-workspace.js');
+        const { runSynthesisAgent } = await import('./synthesis-agent.js');
         const workspace = await materializeEvidenceWorkspace({
           projectId: session.projectId,
           projectSlug: session.project.slug,

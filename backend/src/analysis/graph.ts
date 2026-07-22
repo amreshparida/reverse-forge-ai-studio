@@ -870,7 +870,7 @@ export async function runSpecialistGraphAgents(params: {
   ];
 
   const snapshot = await getAnalysisGraphSnapshot(params.sessionId);
-  const { config } = await import('../config');
+  const { config } = await import('../config.js');
 
   if (config.llm.synthesisAgentEnabled) {
     const project = await prisma.project.findUnique({
@@ -879,9 +879,9 @@ export async function runSpecialistGraphAgents(params: {
     });
     if (!project) throw new Error('Project not found for specialist workspace');
 
-    const { materializeEvidenceWorkspace } = await import('../ai/synthesis-workspace');
-    const { runSynthesisAgent } = await import('../ai/synthesis-agent');
-    const { writeJson: writeJsonFs } = await import('../utils/file-system');
+    const { materializeEvidenceWorkspace } = await import('../ai/synthesis-workspace.js');
+    const { runSynthesisAgent } = await import('../ai/synthesis-agent.js');
+    const { writeJson: writeJsonFs } = await import('../utils/file-system.js');
 
     // Materialize once — specialists share graph coverage + working notes (no OpenAI fallback).
     const workspace = await materializeEvidenceWorkspace({

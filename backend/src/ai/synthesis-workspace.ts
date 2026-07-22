@@ -198,11 +198,11 @@ export async function materializeEvidenceWorkspace(args: {
       const safeUrl = safeWorkspaceFileBase(call.url, 80);
       const file = `${String(n).padStart(4, '0')}_${call.method}_${safeUrl}.json`.slice(0, 180);
       const id = path.basename(file, '.json');
-      writeJson(path.join(networkCallsDir, file), { id, ...call });
+      writeJson(path.join(networkCallsDir, file), { ...call, id });
       networkIndex.push({
         id,
         file,
-        method: call.method,
+        method: call.method ?? 'GET',
         url: call.url,
         status: call.responseStatus,
         resourceType: call.resourceType,

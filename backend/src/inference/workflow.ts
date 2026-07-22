@@ -154,10 +154,9 @@ export function normalizeWorkflowModel(raw: WorkflowModel | Record<string, unkno
   const root = (raw ?? {}) as Record<string, unknown>;
   const list = Array.isArray(root['workflows']) ? (root['workflows'] as Record<string, unknown>[]) : [];
 
-  const workflows: Workflow[] = list
-    .map((item) => {
+  const workflows: Workflow[] = list.flatMap((item) => {
       const name = String(item['name'] ?? '').trim();
-      if (!name) return null;
+      if (!name) return [];
 
       const steps = Array.isArray(item['steps']) ? (item['steps'] as Record<string, unknown>[]) : [];
       let states = Array.isArray(item['states'])
@@ -231,7 +230,7 @@ export function normalizeWorkflowModel(raw: WorkflowModel | Record<string, unkno
           : '') ||
         'Unknown';
 
-      return {
+      return [{
         name,
         description: String(item['description'] ?? ''),
         entityName,
@@ -247,9 +246,8 @@ export function normalizeWorkflowModel(raw: WorkflowModel | Record<string, unkno
             (states.some((s) => /approv|review/i.test(s)) ||
               transitions.some((t) => t.approvalRequired)),
         ),
-      } satisfies Workflow;
-    })
-    .filter((w): w is Workflow => w != null);
+      }];
+    });
 
   return { workflows };
 }
