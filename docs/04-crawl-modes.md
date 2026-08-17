@@ -2,17 +2,18 @@
 
 ## Overview
 
-Three crawl modes are available, each optimized for different scenarios. All three share the same login flow and produce data into the same output structure.
+Four crawl modes are available, each optimized for different scenarios. All modes produce data into the same output structure.
 
 | Mode | Button | LLM Required | Use When |
 |---|---|---|---|
 | BFS Crawler | 🕷 BFS Crawler | No | Fast full coverage of all linked pages |
 | Agentic Crawler | 🤖 Agentic Crawler | Yes | Complex SPAs with tabs, dynamic content |
 | Xpert Crawler | ⚡ Xpert Crawler | Optional (LLM enhances) | Best results — both strategies simultaneously |
+| Manual Crawler | 🧭 Manual Crawler | No | Human-led exploration, authenticated edge cases, tabs and modal states |
 
 ---
 
-## Login Flow (shared by all three modes)
+## Login Flow
 
 When **Login Required** is enabled on the project, all three modes follow the same flow:
 
@@ -27,6 +28,8 @@ When **Login Required** is enabled on the project, all three modes follow the sa
 The session is saved to `backend/sessions/<project-slug>/session.json` for future crawls.
 
 **Important:** The browser never navigates away from the post-login page. The crawl starts exactly where the user is when they click Done.
+
+Manual mode uses a similar control panel, but the operator clicks **Start capture** after login and then continues navigating personally.
 
 ---
 
@@ -162,9 +165,26 @@ Both tabs are in the **same browser context** — same cookies, same session, sa
 
 ---
 
+## 🧭 Manual Crawler
+
+Manual mode opens a headed Chromium browser and lets a human drive the exploration. ReverseForge records evidence in the background.
+
+- A new URL is captured automatically after navigation settles.
+- **Capture current state** records same-URL states such as tabs, accordions, filters, drawers, and modals.
+- **Finish & save** takes a final capture, saves browser session state, writes advanced evidence, and marks the session complete.
+- New tabs are attached automatically and receive their own network, HAR, console, and WebSocket recorders.
+- Login traffic is discarded when capture starts, avoiding contamination of application evidence.
+- Unsafe, excluded, and out-of-domain pages are not captured. Logout/session-ending navigation remains blocked after capture begins.
+
+Each capture writes uniquely named screenshot, HTML, extracted-page JSON, API JSON, and HAR files. `_manual-trace.json` records the ordered operator journey and links it to database page IDs.
+
+The session automatically finalizes after `MANUAL_CRAWL_MAX_MINUTES` (default: 240) if the operator does not finish or close the browser.
+
+---
+
 ## Annotated Screenshots
 
-All three modes produce **two screenshots per page**:
+Automated modes produce annotated/clean screenshots according to their capture strategy. Manual mode produces a clean full-page screenshot for each operator capture.
 
 1. **Viewport screenshot** (`screenshots/<page>.png`) — shows the page with colored numbered boxes overlaid on every detected interactive element
 2. **Full-page screenshot** (`screenshots/full_<page>.png`) — clean, no overlay

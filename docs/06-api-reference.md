@@ -95,6 +95,16 @@ Start a **Xpert (collaborative) crawl** session.
 
 **Error** `409 Conflict` — if a crawl is already running.
 
+### `POST /projects/:projectId/crawls/manual`
+Start a headed, human-guided crawl. No LLM is required.
+
+**Response** `202 Accepted`
+```json
+{ "session": { "id": "uuid", "status": "pending" }, "mode": "manual" }
+```
+
+The browser control panel supports **Start capture** after login, **Capture current state** for same-URL dynamic UI, and **Finish & save**. Only one pending, login-waiting, or running crawl is allowed per project.
+
 ### `GET /projects/:projectId/crawls/:sessionId`
 Get session status and job progress.
 

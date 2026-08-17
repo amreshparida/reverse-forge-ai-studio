@@ -9,6 +9,7 @@ export interface Project {
   screenshotEnabled: boolean;
   networkCaptureEnabled: boolean;
   llmModel?: string;
+  llmApiKeyConfigured?: boolean;
   createdAt: string;
   updatedAt: string;
   crawlSessions?: CrawlSession[];

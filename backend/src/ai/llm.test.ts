@@ -103,10 +103,12 @@ describe('LLM service', () => {
         totalTokens: 15,
       },
     });
-    expect(mocks.debug).toHaveBeenCalledWith('OpenAI response', {
+    expect(mocks.debug).toHaveBeenCalledWith('LLM response', {
       model: 'gpt-test-model',
+      baseUrl: 'default',
       promptTokens: 12,
       completionTokens: 3,
+      contentChars: 11,
     });
   });
 

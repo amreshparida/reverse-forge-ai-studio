@@ -2,7 +2,7 @@ import { prisma } from '../database/client';
 import { config } from '../config';
 import { createLLMClient, isLLMConfigured, type LLMConfig } from '../ai/llm';
 import { buildEntityInferencePrompt } from '../ai/prompts';
-import { getSessionAnalyses, getProjectAnalyses, type PageAnalysisResult } from '../ai/analyzer';
+import { getSessionAnalyses, getProjectAnalyses, getAnalysesForSessions, type PageAnalysisResult } from '../ai/analyzer';
 import { materializePageAnalysisWorkspace } from '../ai/synthesis-workspace';
 import { runSynthesisAgent } from '../ai/synthesis-agent';
 import { logger } from '../utils/logger';
@@ -60,8 +60,11 @@ export async function inferEntities(
   projectId: string,
   llmConfig?: LLMConfig,
   appName?: string,
+  sourceSessionIds?: string[],
 ): Promise<EntityModel> {
-  const analyses = await getProjectAnalyses(projectId);
+  const analyses = sourceSessionIds?.length
+    ? await getAnalysesForSessions(sourceSessionIds)
+    : await getProjectAnalyses(projectId);
   const sessionAnalyses = analyses.length > 0 ? analyses : await getSessionAnalyses(sessionId);
 
   let entityModel: EntityModel;
@@ -76,6 +79,7 @@ export async function inferEntities(
           projectId,
           projectSlug,
           sessionId,
+          sourceSessionIds,
         });
 
         const { artifact, steps } = await runSynthesisAgent<EntityModel>({

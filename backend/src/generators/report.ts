@@ -5,6 +5,8 @@ import { prisma } from '../database/client';
 import { writeText, writeJson, getReportsDir, getSessionOutputDir, fileExists, readJson } from '../utils/file-system';
 import { permissionMatrixToCsv } from '../inference/permissions';
 import { inferArchitecture, buildKnowledgeGraph, type ArchitectureAnalysis } from '../ai/analyzer';
+import { runDeepResearch, type DeepResearchReport } from '../ai/deep-research';
+import { type HarIntelligenceBriefing } from '../ai/har-intelligence';
 import { createLLMClient, isLLMConfigured, resolveSynthesisLlmConfig } from '../ai/llm';
 import { buildExpertReportAnalysisPrompt } from '../ai/prompts';
 import { buildAnalysisGraph, finalizeAnalysisGraphArtifacts, getAnalysisGraphSnapshot, runSpecialistGraphAgents } from '../analysis/graph';
@@ -15,6 +17,7 @@ import type { WorkflowModel, Workflow } from '../inference/workflow';
 import type { PermissionMatrix } from '../inference/permissions';
 import type { LLMConfig } from '../ai/llm';
 import type { GenerationStageId } from './checkpoint';
+import { writeRedevelopmentBundle } from './redevelopment-bundle';
 
 type ExpertReportAnalysis = Record<string, unknown>;
 type CompletenessAudit = Record<string, unknown>;
@@ -35,6 +38,7 @@ export interface ReportGenerationHooks {
   resume?: {
     skipGraphBuild?: boolean;
     skipSpecialists?: boolean;
+    skipDeepResearch?: boolean;
     skipArchitecture?: boolean;
     skipExpert?: boolean;
   };
@@ -171,7 +175,7 @@ function buildCompletenessAudit(args: {
   return {
     generatedAt: new Date().toISOString(),
     guarantee:
-      'Expert LLM evidence includes page AI analyses, truncated API payloads, inferred models, and artifact metadata/hashes. Raw HTML, full artifact file bodies, and the full analysis graph are excluded to keep chunk counts tractable.',
+      'Expert LLM evidence includes page AI analyses, truncated API payloads, full HAR 1.2 files, inferred models, and artifact metadata/hashes. Raw HTML, full HTML artifact bodies, and the full analysis graph are excluded to keep chunk counts tractable.',
     sourceSessionIds: args.sourceSessionIds,
     sourceSessionCount: args.sourceSessionIds.length,
     dbPagesIncluded: args.pages.length,
@@ -243,6 +247,9 @@ async function buildCompleteEvidencePackage(ctx: ReportContext, networkCallsTota
     }),
   ]);
   const completenessAudit = buildCompletenessAudit({ sourceSessionIds, pages, calls, artifactFiles });
+  const { loadHarFilesForSessions } = await import('../ai/har-summary.js');
+  const harFiles = loadHarFilesForSessions(ctx.projectSlug, sourceSessionIds, 60);
+  const harArtifactCount = artifactFiles.filter((f) => f['folder'] === 'har' || String(f['extension']) === '.har').length;
 
   return {
     project: {
@@ -252,6 +259,8 @@ async function buildCompleteEvidencePackage(ctx: ReportContext, networkCallsTota
       sourceSessionIds,
       pagesCaptured: pages.length,
       networkCallsCaptured: networkCallsTotal,
+      harFilesCaptured: harArtifactCount,
+      harFilesIncluded: harFiles.length,
     },
     pages: pages.map((page) => ({
       url: page.url,
@@ -290,6 +299,18 @@ async function buildCompleteEvidencePackage(ctx: ReportContext, networkCallsTota
         graphQLOperationName: call.graphQLOperationName,
       })),
     },
+    har: {
+      totalFiles: harArtifactCount,
+      files: harFiles.map((f) => ({
+        sourceSessionId: f.sourceSessionId,
+        sourceFile: f.sourceFile,
+        pageUrl: f.pageUrl,
+        entryCount: f.entryCount,
+        har: f.har,
+      })),
+    },
+    harIntelligence: readJson(path.join(getReportsDir(ctx.projectSlug, ctx.sessionId), 'har-intelligence.json')),
+    deepResearch: readJson(path.join(getReportsDir(ctx.projectSlug, ctx.sessionId), 'deep-research.json')),
     rawArtifactFiles: {
       totalFiles: artifactFiles.length,
       // hashes/paths only — no file bodies; cap listing size
@@ -554,6 +575,158 @@ async function appendAnalysisGraphFindings(reportLines: string[], sessionId: str
   }
 }
 
+function appendDeepResearchSections(
+  reportLines: string[],
+  briefing: HarIntelligenceBriefing | null,
+  research: DeepResearchReport | null,
+): void {
+  if (!briefing && !research) return;
+
+  reportLines.push('---', '', '## Deep Network Research', '');
+  reportLines.push(
+    'This section is a production-grade research layer: a **deterministic HAR intelligence briefing** (every captured HAR file, templated endpoints, hosts, auth signals) plus an optional **LLM research dossier** grounded in those facts.',
+    '',
+  );
+
+  if (briefing) {
+    reportLines.push('### Observed HAR intelligence', '');
+    for (const fact of briefing.facts) reportLines.push(`- ${fact}`);
+    reportLines.push('');
+    reportLines.push(
+      `| Metric | Value |`,
+      `|--------|-------|`,
+      `| HAR files | ${briefing.stats.harFiles} |`,
+      `| Requests | ${briefing.stats.entries} |`,
+      `| Hosts | ${briefing.stats.uniqueHosts} |`,
+      `| Templated endpoints | ${briefing.stats.uniqueEndpoints} |`,
+      `| XHR/fetch | ${briefing.stats.xhrFetchCount} |`,
+      `| HTTP 401 / 403 | ${briefing.auth.status401} / ${briefing.auth.status403} |`,
+      `| Authorization header | ${briefing.auth.authorizationHeaderPresent ? 'yes' : 'not observed'} |`,
+      `| Set-Cookie | ${briefing.auth.setCookiePresent ? 'yes' : 'not observed'} |`,
+      `| CSRF header | ${briefing.auth.csrfHeaderPresent ? 'yes' : 'not observed'} |`,
+      '',
+    );
+
+    if (briefing.hosts.length) {
+      reportLines.push('### Host inventory', '');
+      reportLines.push('| Host | Category | Requests |', '|------|----------|----------|');
+      for (const host of briefing.hosts.slice(0, 25)) {
+        reportLines.push(`| \`${host.host}\` | ${host.category} | ${host.requestCount} |`);
+      }
+      reportLines.push('');
+    }
+
+    const apiEndpoints = briefing.endpoints.slice(0, 40);
+    if (apiEndpoints.length) {
+      reportLines.push('### Endpoint catalog (templated)', '');
+      reportLines.push('| Method | Pattern | Count | p50 ms | p95 ms | Statuses |', '|--------|---------|-------|--------|--------|----------|');
+      for (const ep of apiEndpoints) {
+        const statuses = Object.entries(ep.statuses).map(([s, n]) => `${s}×${n}`).join(', ');
+        reportLines.push(
+          `| ${ep.method} | \`${ep.urlPattern.slice(0, 90)}\` | ${ep.count} | ${ep.p50Ms} | ${ep.p95Ms} | ${statuses} |`,
+        );
+      }
+      reportLines.push('');
+    }
+
+    if (briefing.slowest.length) {
+      reportLines.push('### Slowest API calls', '');
+      reportLines.push('| ms | Method | URL | Page |', '|----|--------|-----|------|');
+      for (const row of briefing.slowest.slice(0, 12)) {
+        reportLines.push(`| ${row.timeMs} | ${row.method} | \`${row.url.slice(0, 70)}\` | ${row.pageUrl.slice(0, 40)} |`);
+      }
+      reportLines.push('');
+    }
+
+    if (briefing.errors.length) {
+      reportLines.push('### HTTP errors', '');
+      reportLines.push('| Status | Count | Method | Pattern |', '|--------|-------|--------|---------|');
+      for (const err of briefing.errors.slice(0, 15)) {
+        reportLines.push(`| ${err.status} | ${err.count} | ${err.method} | \`${err.urlPattern.slice(0, 80)}\` |`);
+      }
+      reportLines.push('');
+    }
+
+    const seq = briefing.pageSequences.find((p) => p.calls.some((c) => c.resourceType === 'xhr' || c.resourceType === 'fetch'));
+    if (seq && seq.calls.length >= 2) {
+      reportLines.push(`### Example page-load sequence — ${seq.pageUrl}`, '');
+      reportLines.push('```mermaid', 'sequenceDiagram');
+      reportLines.push('  participant Page', '  participant Network');
+      for (const call of seq.calls.slice(0, 12)) {
+        const label = `${call.method} ${call.url.replace(/https?:\/\/[^/]+/, '').slice(0, 50)} (${call.status})`;
+        reportLines.push(`  Page->>Network: ${label.replace(/[:#]/g, ' ')}`);
+      }
+      reportLines.push('```', '');
+    }
+  }
+
+  if (research) {
+    reportLines.push('### Research dossier', '');
+    if (research.researchThesis) {
+      reportLines.push(`**Thesis:** ${research.researchThesis}`, '');
+      reportLines.push(`**Confidence:** ${research.confidence}`, '');
+    }
+    if (research.observedFacts?.length) {
+      reportLines.push('**Observed facts**', '');
+      for (const f of research.observedFacts.slice(0, 20)) reportLines.push(`- ${f}`);
+      reportLines.push('');
+    }
+    if (research.inferences?.length) {
+      reportLines.push('**Inferences**', '');
+      for (const inf of research.inferences.slice(0, 15)) {
+        reportLines.push(`- ${inf.claim} _(confidence ${inf.confidence}; ${inf.evidence?.join(', ') || 'no cite'})_`);
+      }
+      reportLines.push('');
+    }
+    if (research.integrationMap?.firstPartyApiFamilies?.length) {
+      reportLines.push('**First-party API families**', '');
+      for (const fam of research.integrationMap.firstPartyApiFamilies.slice(0, 12)) {
+        reportLines.push(`- **${fam.family}** \`${fam.baseUrlHint}\` — ${fam.purpose} (${fam.methods.join(', ')})`);
+      }
+      reportLines.push('');
+    }
+    if (research.integrationMap?.thirdParties?.length) {
+      reportLines.push('**Third parties**', '');
+      for (const tp of research.integrationMap.thirdParties.slice(0, 15)) {
+        reportLines.push(`- \`${tp.host}\` (${tp.category}) — ${tp.purpose}. Risk: ${tp.risk}`);
+      }
+      reportLines.push('');
+    }
+    if (research.authAndSessionModel) {
+      reportLines.push('**Auth / session model**', '');
+      reportLines.push(`- Mechanism: ${research.authAndSessionModel.mechanism}`);
+      if (research.authAndSessionModel.evidence?.length) {
+        reportLines.push(`- Evidence: ${research.authAndSessionModel.evidence.join('; ')}`);
+      }
+      reportLines.push('');
+    }
+    if (research.riskRegister?.length) {
+      reportLines.push('**Risk register**', '');
+      reportLines.push('| Severity | Title | Recommendation |', '|----------|-------|----------------|');
+      for (const risk of research.riskRegister.slice(0, 15)) {
+        reportLines.push(`| ${risk.severity} | ${risk.title} | ${risk.recommendation} |`);
+      }
+      reportLines.push('');
+    }
+    if (research.reconstructionPlaybook) {
+      const pb = research.reconstructionPlaybook;
+      reportLines.push('**Reconstruction playbook**', '');
+      reportLines.push(`- Approach: ${pb.recommendedApproach}`);
+      if (pb.modulesToRebuildFirst?.length) reportLines.push(`- Rebuild first: ${pb.modulesToRebuildFirst.join(', ')}`);
+      if (pb.dataContractsToClone?.length) reportLines.push(`- Clone contracts: ${pb.dataContractsToClone.join(', ')}`);
+      if (pb.unknownsToValidate?.length) reportLines.push(`- Validate: ${pb.unknownsToValidate.join('; ')}`);
+      reportLines.push('');
+    }
+    if (research.openQuestions?.length) {
+      reportLines.push('**Open questions**', '');
+      for (const q of research.openQuestions.slice(0, 12)) reportLines.push(`- ${q}`);
+      reportLines.push('');
+    }
+  }
+
+  reportLines.push('Artifacts: `har-intelligence.json`, `deep-research.json`, session `har/*.har`.', '');
+}
+
 function appendCoverageSection(reportLines: string[], coverage: Record<string, unknown> | null): void {
   if (!coverage) return;
   const counts = (coverage['counts'] ?? {}) as Record<string, unknown>;
@@ -580,8 +753,76 @@ function writeReportRunManifest(args: {
   rawArtifactFileCount: number;
   architectureAvailable: boolean;
   expertAnalysisAvailable: boolean;
+  deepResearchAvailable?: boolean;
   reportPath: string;
-}): void {
+}): { status: 'complete' | 'degraded'; missingRequiredArtifacts: string[]; warnings: string[] } {
+  const expectedArtifacts = [
+    'final-report.md',
+    'final-report.pdf',
+    'entity-model.json',
+    'workflow-model.json',
+    'permission-matrix.csv',
+    'analysis-graph.json',
+    'analysis-graph-enriched.json',
+    'analysis-coverage.json',
+    'evidence-citation-map.json',
+    'finding-dedupe-summary.json',
+    'complete-analysis-evidence.json',
+    'completeness-audit.json',
+    'expert-analysis-evidence.json',
+    'expert-analysis-chunk-manifest.json',
+    'expert-analysis.json',
+    'knowledge-graph.json',
+    'architecture.json',
+    'har-intelligence.json',
+    'deep-research.json',
+    'redevelopment-blueprint.json',
+    'api-contract-catalog.json',
+    'implementation-backlog.json',
+    'traceability-matrix.csv',
+    'validation-plan.json',
+    'REDEVELOPMENT-README.md',
+  ];
+  const requiredArtifacts = new Set([
+    'final-report.md',
+    'entity-model.json',
+    'workflow-model.json',
+    'permission-matrix.csv',
+    'analysis-graph.json',
+    'analysis-graph-enriched.json',
+    'analysis-coverage.json',
+    'evidence-citation-map.json',
+    'redevelopment-blueprint.json',
+    'api-contract-catalog.json',
+    'implementation-backlog.json',
+    'traceability-matrix.csv',
+    'validation-plan.json',
+    'REDEVELOPMENT-README.md',
+  ]);
+  const artifactInventory = expectedArtifacts.map((name) => {
+    const abs = path.join(args.reportsDir, name);
+    const exists = fileExists(abs);
+    const data = exists ? fs.readFileSync(abs) : null;
+    return {
+      name,
+      required: requiredArtifacts.has(name),
+      exists,
+      sizeBytes: data?.length ?? 0,
+      sha256: data ? sha256(data) : null,
+    };
+  });
+  const missingRequired = artifactInventory
+    .filter((artifact) => artifact.required && !artifact.exists)
+    .map((artifact) => artifact.name);
+  const qualityWarnings = [
+    ...(args.graphFinalization ? [] : ['Analysis graph finalization failed']),
+    ...(args.architectureAvailable ? [] : ['Architecture analysis unavailable']),
+    ...(args.expertAnalysisAvailable ? [] : ['Expert evidence analysis unavailable']),
+    ...(args.deepResearchAvailable ? [] : ['Deep research unavailable']),
+    ...missingRequired.map((name) => `Required artifact missing: ${name}`),
+  ];
+
+  const status = qualityWarnings.length === 0 ? 'complete' : 'degraded';
   writeJson(path.join(args.reportsDir, 'report-run-manifest.json'), {
     run: {
       startedAt: args.startedAt,
@@ -598,6 +839,7 @@ function writeReportRunManifest(args: {
       'permission-inference',
       'graph-indexing',
       'specialist-graph-agents',
+      'deep-network-research',
       'finding-deduplication',
       'coverage-and-citation-map',
       'architecture-inference',
@@ -609,27 +851,17 @@ function writeReportRunManifest(args: {
     graphFinalization: args.graphFinalization,
     architectureAvailable: args.architectureAvailable,
     expertAnalysisAvailable: args.expertAnalysisAvailable,
-    artifacts: [
-      'final-report.md',
-      'final-report.pdf',
-      'entity-model.json',
-      'workflow-model.json',
-      'permission-matrix.csv',
-      'analysis-graph.json',
-      'analysis-graph-enriched.json',
-      'analysis-coverage.json',
-      'evidence-citation-map.json',
-      'finding-dedupe-summary.json',
-      'complete-analysis-evidence.json',
-      'completeness-audit.json',
-      'expert-analysis-evidence.json',
-      'expert-analysis-chunk-manifest.json',
-      'expert-analysis.json',
-      'knowledge-graph.json',
-      'architecture.json',
-    ],
+    deepResearchAvailable: args.deepResearchAvailable ?? false,
+    quality: {
+      status,
+      warnings: qualityWarnings,
+      missingRequiredArtifacts: missingRequired,
+    },
+    artifacts: artifactInventory.filter((artifact) => artifact.exists).map((artifact) => artifact.name),
+    artifactInventory,
     reportPath: args.reportPath,
   });
+  return { status, missingRequiredArtifacts: missingRequired, warnings: qualityWarnings };
 }
 
 export async function generateFullReport(
@@ -699,12 +931,52 @@ export async function generateFullReport(
       appName: ctx.appName,
       reportsDir,
       llmConfig: ctx.llmConfig,
-    }).catch((err) => {
-      logger.warn('Specialist graph agents skipped/failed: ' + (err instanceof Error ? err.message : String(err)));
     });
     await hooks.onStageComplete?.('specialist-agents', 'Specialist graph agents complete');
   } else {
     logger.info('[Generation] Skipping specialist-agents (checkpoint)');
+  }
+
+  let harBriefing: HarIntelligenceBriefing | null = null;
+  let deepResearch: DeepResearchReport | null = null;
+  if (!hooks.resume?.skipDeepResearch) {
+    await hooks.onStageStart?.('deep-research', 'Deep network research: HAR intelligence + research dossier');
+    try {
+      const result = await runDeepResearch({
+        sessionId: ctx.sessionId,
+        projectId: ctx.projectId,
+        projectSlug: ctx.projectSlug,
+        appName: ctx.appName,
+        sourceSessionIds,
+        reportsDir,
+        llmConfig: ctx.llmConfig,
+      });
+      harBriefing = result.briefing;
+      deepResearch = result.research;
+    } catch (err) {
+      logger.warn('Deep research skipped/failed: ' + (err instanceof Error ? err.message : String(err)));
+      harBriefing = readJson<HarIntelligenceBriefing>(path.join(reportsDir, 'har-intelligence.json'));
+    }
+    await hooks.onStageComplete?.(
+      'deep-research',
+      deepResearch ? 'Deep research dossier complete' : 'HAR intelligence captured',
+      {
+        ...(fileExists(path.join(reportsDir, 'har-intelligence.json'))
+          ? { harIntelligencePath: path.join(reportsDir, 'har-intelligence.json') }
+          : {}),
+        ...(fileExists(path.join(reportsDir, 'deep-research.json'))
+          ? { deepResearchPath: path.join(reportsDir, 'deep-research.json') }
+          : {}),
+      },
+    );
+  } else {
+    logger.info('[Generation] Skipping deep-research (checkpoint)');
+    harBriefing = fileExists(path.join(reportsDir, 'har-intelligence.json'))
+      ? readJson<HarIntelligenceBriefing>(path.join(reportsDir, 'har-intelligence.json'))
+      : null;
+    deepResearch = fileExists(path.join(reportsDir, 'deep-research.json'))
+      ? readJson<DeepResearchReport>(path.join(reportsDir, 'deep-research.json'))
+      : null;
   }
 
   const graphFinalization = await finalizeAnalysisGraphArtifacts(ctx.sessionId, reportsDir, sourceSessionIds).catch((err) => {
@@ -739,6 +1011,12 @@ export async function generateFullReport(
     `- **Source Sessions:** ${sourceSessionIds.length}`,
     `- **Analysis Graph:** ${graphContext.nodeCount} nodes, ${graphContext.edgeCount} edges, ${graphContext.findingCount} initial findings`,
     `- **Raw Artifact Files Fed:** ${rawArtifactFileCount}`,
+    ...(harBriefing
+      ? [
+          `- **HAR files:** ${harBriefing.stats.harFiles} (${harBriefing.stats.entries} requests, ${harBriefing.stats.uniqueEndpoints} templated endpoints)`,
+          `- **Hosts:** ${harBriefing.stats.uniqueHosts} · XHR/fetch: ${harBriefing.stats.xhrFetchCount}`,
+        ]
+      : []),
     '',
     '---',
     '',
@@ -861,6 +1139,8 @@ export async function generateFullReport(
     reportLines.push(`\n*... and ${networkCallsTotal - 100} more (see api/ directory for full list)*`);
   }
   reportLines.push('');
+
+  appendDeepResearchSections(reportLines, harBriefing, deepResearch);
 
   // Entity Relationship Model — with Mermaid ER diagram
   reportLines.push('---', '', '## Entity Relationship Model', '');
@@ -1007,6 +1287,19 @@ export async function generateFullReport(
   writeJson(path.join(reportsDir, 'workflow-model.json'), ctx.workflowModel);
   writeText(path.join(reportsDir, 'permission-matrix.csv'), permissionMatrixToCsv(ctx.permissionMatrix));
 
+  await writeRedevelopmentBundle({
+    projectId: ctx.projectId,
+    sessionId: ctx.sessionId,
+    sourceSessionIds,
+    appName: ctx.appName,
+    reportsDir,
+    entityModel: ctx.entityModel,
+    workflowModel: ctx.workflowModel,
+    permissionMatrix: ctx.permissionMatrix,
+    architectureAvailable: Boolean(architectureAnalysis),
+    deepResearchAvailable: Boolean(deepResearch || harBriefing),
+  });
+
   // Generate PDF placeholder using Playwright
   await generatePdf(reportPath, path.join(reportsDir, 'final-report.pdf')).catch((err) => {
     logger.warn('PDF generation skipped: ' + (err instanceof Error ? err.message : String(err)));
@@ -1022,7 +1315,7 @@ export async function generateFullReport(
     },
   });
 
-  writeReportRunManifest({
+  const runManifest = writeReportRunManifest({
     reportsDir,
     ctx,
     startedAt,
@@ -1031,8 +1324,13 @@ export async function generateFullReport(
     rawArtifactFileCount,
     architectureAvailable: Boolean(architectureAnalysis),
     expertAnalysisAvailable: Boolean(expertAnalysis),
+    deepResearchAvailable: Boolean(deepResearch || harBriefing),
     reportPath,
   });
+
+  if (runManifest.missingRequiredArtifacts.length > 0) {
+    throw new Error(`Required report artifacts missing: ${runManifest.missingRequiredArtifacts.join(', ')}`);
+  }
 
   await hooks.onStageComplete?.('final-report', 'Final report written');
 

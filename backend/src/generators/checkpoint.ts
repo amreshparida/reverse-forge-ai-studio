@@ -6,13 +6,14 @@ import type { PermissionMatrix } from '../inference/permissions';
 
 export const GENERATION_STAGES = [
   { id: 'page-analysis', label: 'Page AI analysis', progress: 12 },
-  { id: 'entity-inference', label: 'Entity inference', progress: 28 },
-  { id: 'workflow-inference', label: 'Workflow inference', progress: 42 },
-  { id: 'permission-inference', label: 'Permission inference', progress: 52 },
-  { id: 'graph-indexing', label: 'Analysis graph indexing', progress: 62 },
-  { id: 'specialist-agents', label: 'Specialist graph agents', progress: 72 },
-  { id: 'architecture-and-kg', label: 'Architecture & knowledge graph', progress: 80 },
-  { id: 'expert-analysis', label: 'Expert evidence analysis', progress: 92 },
+  { id: 'entity-inference', label: 'Entity inference', progress: 26 },
+  { id: 'workflow-inference', label: 'Workflow inference', progress: 38 },
+  { id: 'permission-inference', label: 'Permission inference', progress: 48 },
+  { id: 'graph-indexing', label: 'Analysis graph indexing', progress: 56 },
+  { id: 'specialist-agents', label: 'Specialist graph agents', progress: 66 },
+  { id: 'deep-research', label: 'Deep network research', progress: 76 },
+  { id: 'architecture-and-kg', label: 'Architecture & knowledge graph', progress: 84 },
+  { id: 'expert-analysis', label: 'Expert evidence analysis', progress: 94 },
   { id: 'final-report', label: 'Final report writing', progress: 100 },
 ] as const;
 
@@ -45,6 +46,8 @@ export interface GenerationCheckpoint {
     permissionMatrixPath?: string;
     architecturePath?: string;
     expertAnalysisPath?: string;
+    harIntelligencePath?: string;
+    deepResearchPath?: string;
   };
 }
 

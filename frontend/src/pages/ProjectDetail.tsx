@@ -29,6 +29,7 @@ export default function ProjectDetail() {
   const [crawlLoading, setCrawlLoading] = useState(false);
   const [agentLoading, setAgentLoading] = useState(false);
   const [collabLoading, setCollabLoading] = useState(false);
+  const [manualLoading, setManualLoading] = useState(false);
   const [reportLoading, setReportLoading] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [deleteSession, setDeleteSession] = useState<CrawlSession | null>(null);
@@ -95,6 +96,19 @@ export default function ProjectDetail() {
     }
   };
 
+  const handleManualCrawl = async () => {
+    if (!projectId) return;
+    if (goToActiveCrawlIfAny()) return;
+    setManualLoading(true);
+    try {
+      const res = await api.startManualCrawl(projectId);
+      navigate(`/projects/${projectId}/crawls/${res.session.id}`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to start manual crawl');
+      setManualLoading(false);
+    }
+  };
+
   const handleExtractReport = async () => {
     if (!projectId) return;
     setReportLoading(true);
@@ -157,7 +171,7 @@ export default function ProjectDetail() {
             <>
               <button
                 onClick={() => { void handleStartCrawl(); }}
-                disabled={crawlLoading || agentLoading || collabLoading}
+                disabled={crawlLoading || agentLoading || collabLoading || manualLoading}
                 title="BFS Crawler: systematically follows all links breadth-first."
                 className="btn-secondary"
               >
@@ -165,7 +179,7 @@ export default function ProjectDetail() {
               </button>
               <button
                 onClick={() => { void handleAgentCrawl(); }}
-                disabled={agentLoading || crawlLoading || collabLoading}
+                disabled={agentLoading || crawlLoading || collabLoading || manualLoading}
                 title="LLM-driven: Planner → Navigator → Observer loop. Intelligently explores tabs, dynamic content and hidden pages."
                 className="btn-secondary"
               >
@@ -173,18 +187,26 @@ export default function ProjectDetail() {
               </button>
               <button
                 onClick={() => { void handleCollaborativeCrawl(); }}
-                disabled={collabLoading || crawlLoading || agentLoading || reportLoading}
+                disabled={collabLoading || crawlLoading || agentLoading || manualLoading || reportLoading}
                 title="Xpert Crawler: BFS Explorer + LLM Navigator run simultaneously, sharing a live knowledge base."
                 className="btn-secondary border-brand-300 text-brand-700 hover:bg-brand-50"
               >
                 {collabLoading ? 'Starting…' : '⚡ Xpert Crawler'}
+              </button>
+              <button
+                onClick={() => { void handleManualCrawl(); }}
+                disabled={manualLoading || crawlLoading || agentLoading || collabLoading || reportLoading}
+                title="Manual Crawler: you explore in a headed browser while ReverseForge automatically captures each page, API/HAR traffic, and dynamic states on demand."
+                className="btn-secondary border-emerald-300 text-emerald-700 hover:bg-emerald-50"
+              >
+                {manualLoading ? 'Starting…' : '🧭 Manual Crawler'}
               </button>
             </>
           )}
           {hasAnySession && (
             <button
               onClick={() => { void handleExtractReport(); }}
-              disabled={reportLoading || completedSessions.length === 0 || crawlLoading || agentLoading || collabLoading}
+              disabled={reportLoading || completedSessions.length === 0 || crawlLoading || agentLoading || collabLoading || manualLoading}
               title={completedSessions.length === 0 ? 'Complete at least one crawl session before extracting a project report.' : 'Runs the full analysis orchestrator across all completed sessions in this project.'}
               className="btn-primary"
             >
@@ -385,4 +407,3 @@ export default function ProjectDetail() {
     </div>
   );
 }
-

@@ -19,8 +19,16 @@ import { crawlLogBus } from '../crawler/live-log';
 import { generationProgressBus } from '../generators/progress-bus';
 import { reconcileStaleCheckpoints } from '../generators/checkpoint';
 import { prisma } from '../database/client';
+import { timingSafeEqual } from 'crypto';
 
 const app = express();
+
+function tokenMatches(candidate: string | undefined, expected: string): boolean {
+  if (!candidate) return false;
+  const left = Buffer.from(candidate);
+  const right = Buffer.from(expected);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
 
 // ── Security middleware ──────────────────────────────────────────────────────
 app.use(
@@ -29,6 +37,16 @@ app.use(
     contentSecurityPolicy: false, // relaxed for local tool
   }),
 );
+
+// Optional deployment authentication. Local-only binding remains the safe default.
+app.use(['/api', '/static'], (req, res, next) => {
+  const expected = config.security.apiAuthToken;
+  if (!expected || req.originalUrl.startsWith('/api/health')) return next();
+  const bearer = req.header('authorization')?.replace(/^Bearer\s+/i, '');
+  const apiKey = req.header('x-api-key');
+  if (tokenMatches(bearer, expected) || tokenMatches(apiKey, expected)) return next();
+  res.status(401).json({ error: 'Authentication required' });
+});
 
 app.use(
   cors({
@@ -128,7 +146,9 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
       return res.status(400).json({ error: 'Validation error', details: (err as { issues: unknown }).issues });
     }
     logger.error('Unhandled error', { message: err.message, stack: err.stack });
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({
+      error: config.nodeEnv === 'production' ? 'Internal server error' : err.message,
+    });
   }
   res.status(500).json({ error: 'Internal server error' });
 });
@@ -152,10 +172,14 @@ async function start(): Promise<void> {
     logger.warn('Failed to reconcile generation checkpoints: ' + (err instanceof Error ? err.message : String(err)));
   }
 
-  app.listen(config.port, () => {
-    logger.info(`🚀 ReverseForge AI Studio running on http://localhost:${config.port}`);
-    logger.info(`   API: http://localhost:${config.port}/api`);
-    logger.info(`   Docs: http://localhost:${config.port}/api/health`);
+  if (config.host !== '127.0.0.1' && config.host !== 'localhost' && !config.security.apiAuthToken) {
+    throw new Error('API_AUTH_TOKEN is required when HOST is not loopback');
+  }
+
+  app.listen(config.port, config.host, () => {
+    logger.info(`🚀 ReverseForge AI Studio running on http://${config.host}:${config.port}`);
+    logger.info(`   API: http://${config.host}:${config.port}/api`);
+    logger.info(`   Docs: http://${config.host}:${config.port}/api/health`);
   });
 }
 

@@ -1,8 +1,15 @@
 const BASE_URL = '/api';
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const apiToken = typeof window !== 'undefined'
+    ? window.sessionStorage.getItem('reverseforge-api-token')
+    : null;
   const res = await fetch(`${BASE_URL}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+      ...options?.headers,
+    },
     ...options,
   });
 
@@ -48,6 +55,8 @@ export const api = {
     request<{ session: import('../types').CrawlSession; mode: string }>(`/projects/${projectId}/crawls/agent`, { method: 'POST' }),
   startCollaborativeCrawl: (projectId: string) =>
     request<{ session: import('../types').CrawlSession; mode: string }>(`/projects/${projectId}/crawls/collaborative`, { method: 'POST' }),
+  startManualCrawl: (projectId: string) =>
+    request<{ session: import('../types').CrawlSession; mode: string }>(`/projects/${projectId}/crawls/manual`, { method: 'POST' }),
   getCrawl: (projectId: string, sessionId: string) =>
     request<{ session: import('../types').CrawlSession; job: import('../types').Job | null }>(
       `/projects/${projectId}/crawls/${sessionId}`,

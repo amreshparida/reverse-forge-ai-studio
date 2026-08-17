@@ -734,13 +734,14 @@ export async function computeAnalysisCoverage(sessionId: string, sourceSessionId
   const callsWithResponse = calls.filter((call) => Boolean(call.responseBody)).length;
   const lowConfidenceNodes = nodes.filter((node) => typeof node.confidence === 'number' && node.confidence < 0.7).length;
 
+  // Absence of evidence is not complete coverage. Empty corpora must never score 100.
   const ratios = {
-    pagesWithExtractedData: pages.length ? pagesWithExtracted / pages.length : 1,
-    pagesWithAiAnalysis: pages.length ? pagesWithAi / pages.length : 1,
-    apiCallsWithRequestPayload: calls.length ? callsWithPayload / calls.length : 1,
-    apiCallsWithResponseBody: calls.length ? callsWithResponse / calls.length : 1,
-    findingsWithEvidence: findings.length ? findingsWithEvidence / findings.length : 1,
-    graphConnectedNodes: nodes.length ? connectedIds.size / nodes.length : 1,
+    pagesWithExtractedData: pages.length ? pagesWithExtracted / pages.length : 0,
+    pagesWithAiAnalysis: pages.length ? pagesWithAi / pages.length : 0,
+    apiCallsWithRequestPayload: calls.length ? callsWithPayload / calls.length : 0,
+    apiCallsWithResponseBody: calls.length ? callsWithResponse / calls.length : 0,
+    findingsWithEvidence: findings.length ? findingsWithEvidence / findings.length : 0,
+    graphConnectedNodes: nodes.length ? connectedIds.size / nodes.length : 0,
   };
 
   const coverageScore = Math.round(
@@ -753,6 +754,7 @@ export async function computeAnalysisCoverage(sessionId: string, sourceSessionId
 
   return {
     score: coverageScore,
+    insufficientEvidence: pages.length === 0 || nodes.length === 0 || findings.length === 0,
     ratios,
     counts: {
       nodes: nodes.length,
@@ -883,7 +885,8 @@ export async function runSpecialistGraphAgents(params: {
     const { runSynthesisAgent } = await import('../ai/synthesis-agent.js');
     const { writeJson: writeJsonFs } = await import('../utils/file-system.js');
 
-    // Materialize once — specialists share graph coverage + working notes (no OpenAI fallback).
+    // Materialize graph chunks once. Each specialist independently drains them and keeps
+    // its own reasoning pass so one specialist's interpretation cannot anchor the others.
     const workspace = await materializeEvidenceWorkspace({
       projectId: params.projectId,
       projectSlug: project.slug,
@@ -909,7 +912,7 @@ export async function runSpecialistGraphAgents(params: {
             specialistFocus: `${agent.name}: ${agent.focus}`,
             coverage: { requireAllGraphChunks: true },
             extraAllowedArtifacts: [artifactName],
-            reuseSharedEvidence: true,
+            reuseSharedEvidence: false,
           }),
         { label: `Specialist ${agent.name}`, delayMs: 15_000, maxDelayMs: 180_000 },
       );

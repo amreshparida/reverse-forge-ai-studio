@@ -41,14 +41,33 @@ export interface PageAnalysisResult {
   confidenceScore: number;
 }
 
+export interface SessionAnalysisSummary {
+  sessionId: string;
+  totalPages: number;
+  eligiblePages: number;
+  analyzed: number;
+  alreadyAnalyzed: number;
+  invalidExtractedData: number;
+  failed: Array<{ pageId: string; url: string; error: string }>;
+}
+
 export async function analyzeSession(
   sessionId: string,
   llmConfig?: LLMConfig,
   appName?: string,
-): Promise<void> {
+): Promise<SessionAnalysisSummary> {
+  const summary: SessionAnalysisSummary = {
+    sessionId,
+    totalPages: 0,
+    eligiblePages: 0,
+    analyzed: 0,
+    alreadyAnalyzed: 0,
+    invalidExtractedData: 0,
+    failed: [],
+  };
   if (!isLLMConfigured(llmConfig)) {
     logger.warn('LLM not configured, skipping AI analysis');
-    return;
+    return summary;
   }
 
   const llm = createLLMClient(llmConfig);
@@ -56,6 +75,8 @@ export async function analyzeSession(
     where: { crawlSessionId: sessionId },
     orderBy: { createdAt: 'asc' },
   });
+  summary.totalPages = pages.length;
+  summary.alreadyAnalyzed = pages.filter((page) => Boolean(page.aiAnalysis)).length;
 
   type QueueItem = (typeof pages)[number];
   const queue: QueueItem[] = pages.filter((page) => {
@@ -66,6 +87,9 @@ export async function analyzeSession(
     if (!page.extractedData) return false;
     return true;
   });
+  summary.eligiblePages = queue.length;
+  const queueAttempts = new Map<string, number>();
+  const maxQueueAttempts = 2;
 
   logger.info(`Analyzing ${queue.length} pages with AI (${pages.length} total)`);
 
@@ -76,6 +100,7 @@ export async function analyzeSession(
       extractedData = JSON.parse(page.extractedData!) as PageExtractedData;
     } catch {
       logger.warn(`Skipping page with invalid extractedData: ${page.url}`);
+      summary.invalidExtractedData += 1;
       continue;
     }
 
@@ -111,23 +136,34 @@ export async function analyzeSession(
       });
 
       logger.info(`AI analyzed: ${page.url} -> ${analysis.businessModule}/${analysis.primaryEntity}`);
+      summary.analyzed += 1;
       await sleep(1200);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
 
       if (isTransientAnalysisError(err)) {
-        queue.push(page);
-        logger.warn(`AI analysis exhausted retries for ${page.url} — re-queued (queue=${queue.length})`, {
-          error: errMsg,
-        });
-        await sleep(3000);
-        continue;
+        const attempts = (queueAttempts.get(page.id) ?? 0) + 1;
+        queueAttempts.set(page.id, attempts);
+        if (attempts < maxQueueAttempts) {
+          queue.push(page);
+          logger.warn(
+            `AI analysis exhausted retries for ${page.url} — re-queued (${attempts}/${maxQueueAttempts}, queue=${queue.length})`,
+            { error: errMsg },
+          );
+          await sleep(3000);
+          continue;
+        }
       }
 
-      // Non-transient (e.g. bad JSON / invalid response shape) — skip permanently
       logger.error(`AI analysis failed for page ${page.url}`, { error: errMsg });
+      summary.failed.push({ pageId: page.id, url: page.url, error: errMsg });
     }
   }
+
+  logger.info(
+    `AI analysis summary for ${sessionId}: analyzed=${summary.analyzed}, existing=${summary.alreadyAnalyzed}, failed=${summary.failed.length}, invalid=${summary.invalidExtractedData}`,
+  );
+  return summary;
 }
 
 function isTransientAnalysisError(err: unknown): boolean {
@@ -289,7 +325,7 @@ export async function inferArchitecture(
         });
 
         if (analysisOutputPath) {
-          for (const name of ['entity-model.json', 'workflow-model.json', 'permission-matrix.json'] as const) {
+          for (const name of ['entity-model.json', 'workflow-model.json', 'permission-matrix.json', 'har-intelligence.json', 'deep-research.json'] as const) {
             const src = path.join(analysisOutputPath, '_generation', name);
             const alt = path.join(analysisOutputPath, name);
             const from = fs.existsSync(src) ? src : fs.existsSync(alt) ? alt : null;
@@ -305,7 +341,7 @@ export async function inferArchitecture(
           expectedArtifact: 'architecture.json',
           appName,
           llmConfig,
-          coverage: { requireAllPages: true, requireAllApis: true },
+          coverage: { requireAllPages: true, requireAllApis: true, requireAllHars: true },
         });
 
         if (analysisOutputPath) {
@@ -351,6 +387,9 @@ export async function inferArchitecture(
       .filter((p) => p.aiAnalysis)
       .map((p) => ({ url: p.url, title: p.title, ...JSON.parse(p.aiAnalysis!) as Record<string, unknown> }));
 
+    const { loadHarFilesForSessions } = await import('./har-summary.js');
+    const harFiles = loadHarFilesForSessions(session.project.slug, sessionIds, 40);
+
     const result = await retryUntilSuccess(
       () =>
         llm.chatJson<ArchitectureAnalysis>(
@@ -359,7 +398,16 @@ export async function inferArchitecture(
               role: 'system',
               content: 'You are a senior software architect. Infer the technical architecture from application evidence.',
             },
-            { role: 'user', content: buildArchitectureInferencePrompt(pageAnalyses, networkCalls, appName) },
+            {
+              role: 'user',
+              content: buildArchitectureInferencePrompt(
+                pageAnalyses,
+                networkCalls,
+                appName,
+                undefined,
+                harFiles.map((h) => h.har),
+              ),
+            },
           ],
           { maxTokens: 3000 },
         ),
@@ -447,12 +495,29 @@ export async function buildKnowledgeGraph(
     );
   } else if (isLLMConfigured(llmConfig)) {
     const llm = createLLMClient(llmConfig);
+    const sessionMeta = await prisma.crawlSession.findUnique({
+      where: { id: sessionId },
+      select: { project: { select: { slug: true } } },
+    });
+    const { loadHarFilesForSessions } = await import('./har-summary.js');
+    const harFiles = sessionMeta
+      ? loadHarFilesForSessions(sessionMeta.project.slug, sessionIds, 40)
+      : [];
     graph = await retryUntilSuccess(
       () =>
         llm.chatJson(
           [
             { role: 'system', content: 'You are a knowledge graph expert. Build a structured graph from application evidence.' },
-            { role: 'user', content: buildKnowledgeGraphPrompt(pages, entities, networkCalls, appName) },
+            {
+              role: 'user',
+              content: buildKnowledgeGraphPrompt(
+                pages,
+                entities,
+                networkCalls,
+                appName,
+                harFiles.map((h) => h.har),
+              ),
+            },
           ],
           { maxTokens: 5000 },
         ),
@@ -512,5 +577,26 @@ export async function getProjectAnalyses(projectId: string): Promise<PageAnalysi
     }
   }
 
+  return results;
+}
+
+/** Return de-duplicated analyses from exactly the declared evidence sessions. */
+export async function getAnalysesForSessions(sessionIds: string[]): Promise<PageAnalysisResult[]> {
+  const pages = await prisma.pageCapture.findMany({
+    where: { aiAnalysis: { not: null }, crawlSessionId: { in: [...new Set(sessionIds)] } },
+    select: { aiAnalysis: true, url: true },
+    orderBy: { createdAt: 'desc' },
+  });
+  const seen = new Set<string>();
+  const results: PageAnalysisResult[] = [];
+  for (const page of pages) {
+    if (seen.has(page.url)) continue;
+    seen.add(page.url);
+    try {
+      results.push(JSON.parse(page.aiAnalysis!) as PageAnalysisResult);
+    } catch {
+      // Invalid page analyses are accounted for during the page-analysis stage.
+    }
+  }
   return results;
 }

@@ -111,9 +111,10 @@ Infers role-based access control from visible UI elements:
 
 ### 4. Architecture Inference
 
-Synthesizes the full system architecture from network calls and JS intelligence:
+Synthesizes the full system architecture from network calls, full per-page HAR files, and JS intelligence:
 
 - API patterns (REST, GraphQL, RPC)
+- HAR waterfall (all resource types, hosts, auth/CDN/API signals)
 - Frontend framework(s) detected
 - State management libraries
 - Authentication mechanism (JWT, session cookie, SAML)
@@ -131,6 +132,25 @@ After all inference is complete, a knowledge graph is built linking:
 - Workflows to the entities they govern
 
 This graph is used to produce the Mermaid `erDiagram` and `stateDiagram-v2` sections of the final report.
+
+---
+
+## 5. Deep Network Research
+
+After specialist graph agents, a dedicated research stage runs:
+
+1. **HAR intelligence (deterministic)** — reads every `har/*.har` file and produces `har-intelligence.json`:
+   - Templated endpoint catalog (UUIDs/IDs collapsed) with status histograms and p50/p95 timing
+   - Host inventory classified first-party vs CDN / analytics / auth / payments / error-tracking
+   - Auth signals (401/403, Authorization, Set-Cookie, CSRF)
+   - Page-load API sequences, GraphQL operations, errors, slowest calls
+2. **Research dossier (LLM)** — synthesis agent drains full HAR files + API captures, seeded with the intelligence facts, and writes `deep-research.json`:
+   - Observed facts vs inferences (with confidence)
+   - Integration map and auth/session model
+   - Contract catalog and page-load stories
+   - Risk register and reconstruction playbook
+
+These artifacts are embedded in the markdown report (**Deep Network Research**) and passed into expert evidence analysis.
 
 ---
 

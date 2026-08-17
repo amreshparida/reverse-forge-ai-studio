@@ -40,6 +40,17 @@ const SENSITIVE_BODY_KEYS = new Set([
 ]);
 
 const MASK = '***REDACTED***';
+const MAX_MASK_DEPTH = 20;
+const NORMALIZED_SENSITIVE_BODY_KEYS = new Set(
+  [...SENSITIVE_BODY_KEYS].map((key) => key.replace(/[^a-z0-9]/g, '')),
+);
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
+const BEARER_PATTERN = /(bearer\s+)[A-Za-z0-9._~+\/-]+=*/gi;
+
+export function isSensitiveKey(key: string): boolean {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return NORMALIZED_SENSITIVE_BODY_KEYS.has(normalized);
+}
 
 export function maskHeaders(
   headers: Record<string, string | string[] | undefined>,
@@ -52,14 +63,29 @@ export function maskHeaders(
 }
 
 export function maskBody(body: unknown, depth = 0): unknown {
-  if (depth > 5) return body;
+  // Never return deep content unmasked: nested payloads often contain auth or PII.
+  if (depth > MAX_MASK_DEPTH) return MASK;
   if (body === null || body === undefined) return body;
   if (typeof body === 'string') {
     try {
       const parsed: unknown = JSON.parse(body);
       return JSON.stringify(maskBody(parsed, depth + 1));
     } catch {
-      return body;
+      // Cover form-encoded and plain-text credential formats that are not JSON.
+      if (/^[^=&\s]+=[^&]*(?:&[^=&\s]+=[^&]*)*$/.test(body)) {
+        const params = new URLSearchParams(body);
+        for (const key of [...params.keys()]) {
+          if (isSensitiveKey(key)) params.set(key, MASK);
+        }
+        return params.toString();
+      }
+      return body
+        .replace(BEARER_PATTERN, `$1${MASK}`)
+        .replace(JWT_PATTERN, MASK)
+        .replace(
+          /((?:access[_-]?token|refresh[_-]?token|api[_-]?key|password|passwd|secret|authorization)\s*[=:]\s*)[^\s&,;]+/gi,
+          `$1${MASK}`,
+        );
     }
   }
   if (Array.isArray(body)) {
@@ -69,7 +95,7 @@ export function maskBody(body: unknown, depth = 0): unknown {
     const obj = body as Record<string, unknown>;
     const result: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(obj)) {
-      result[key] = SENSITIVE_BODY_KEYS.has(key.toLowerCase())
+      result[key] = isSensitiveKey(key)
         ? MASK
         : maskBody(value, depth + 1);
     }
@@ -81,11 +107,8 @@ export function maskBody(body: unknown, depth = 0): unknown {
 export function maskUrl(url: string): string {
   try {
     const parsed = new URL(url);
-    const sensitiveParams = ['token', 'key', 'secret', 'password', 'auth', 'api_key'];
-    for (const param of sensitiveParams) {
-      if (parsed.searchParams.has(param)) {
-        parsed.searchParams.set(param, MASK);
-      }
+    for (const param of [...parsed.searchParams.keys()]) {
+      if (isSensitiveKey(param)) parsed.searchParams.set(param, MASK);
     }
     return parsed.toString();
   } catch {

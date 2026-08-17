@@ -28,6 +28,7 @@ import {
   getHtmlDir,
   getPagesDir,
   getApiDir,
+  getHarDir,
   writeJson,
   writeText,
   urlToFilename,
@@ -89,6 +90,8 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
   let browser: Browser | null = null;
   let context: BrowserContext | null = null;
   let logOverlay: LogOverlayHandle | null = null;
+  let networkRecorder: ReturnType<typeof createNetworkRecorder> | null = null;
+  let wsRecorder: ReturnType<typeof createWebSocketRecorder> | null = null;
   /** Headed browser (login always headed, or CRAWL_HEADLESS=false) */
   let headed = false;
 
@@ -181,6 +184,7 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
     const htmlDir = getHtmlDir(projectSlug, session.id);
     const pagesDir = getPagesDir(projectSlug, session.id);
     const apiDir = getApiDir(projectSlug, session.id);
+    const harDir = getHarDir(projectSlug, session.id);
 
     // ── ONE persistent page for the entire crawl ──────────────────────────
     let crawlPage =
@@ -200,8 +204,8 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
     }
 
     // Attach recorders ONCE
-    const networkRecorder = project.networkCaptureEnabled ? createNetworkRecorder(crawlPage) : null;
-    const wsRecorder = createWebSocketRecorder(crawlPage);
+    networkRecorder = project.networkCaptureEnabled ? createNetworkRecorder(crawlPage) : null;
+    wsRecorder = createWebSocketRecorder(crawlPage);
 
     // Attach console recorder ONCE — reset between pages
     const consoleEntries: Array<{ type: 'error' | 'warning' | 'info' | 'log'; text: string }> = [];
@@ -249,7 +253,7 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
       logger.info(`Crawling [${depth}/${maxDepth}]: ${normalizedUrl}`);
 
       // Reset per-page accumulators (reuse same tab — no new page!)
-      networkRecorder?.reset();
+      await networkRecorder?.reset();
       consoleEntries.length = 0;
 
       const pageStartTime = Date.now();
@@ -424,11 +428,15 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
           },
         });
 
-        // Save network calls
+        // Save network calls (+ per-page HAR alongside existing API JSON strategy)
         if (project.networkCaptureEnabled) {
+          await networkRecorder!.flush();
           const calls = networkRecorder!.getCalls();
           const apiJsonPath = path.join(apiDir, urlToFilename(normalizedUrl, '-api.json'));
           writeJson(apiJsonPath, calls);
+
+          const har = networkRecorder!.getHar(normalizedUrl);
+          writeJson(path.join(harDir, urlToFilename(normalizedUrl, '.har')), har);
 
           // Persist network calls to DB
           if (calls.length > 0) {
@@ -523,6 +531,7 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
       }
 
       // 2. GraphQL introspection (detect endpoint from recorded network calls)
+      await networkRecorder?.flush();
       const allCalls = networkRecorder?.getCalls() ?? [];
       const gqlEndpoints = [...new Set(
         allCalls
@@ -540,7 +549,7 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
       }
 
       // 3. WebSocket captures
-      const wsCaptures = wsRecorder.getCaptures();
+      const wsCaptures = wsRecorder?.getCaptures() ?? [];
       if (wsCaptures.length > 0) {
         writeJson(path.join(apiDir, '_websocket-captures.json'), wsCaptures);
         logger.info(`[Advanced] WebSocket: ${wsCaptures.length} connections, ${wsCaptures.reduce((s, c) => s + c.messageCount, 0)} total messages`);
@@ -575,6 +584,8 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
     }).catch(() => undefined); // ignore if session was deleted by cascade
     throw err;
   } finally {
+    await networkRecorder?.stop();
+    wsRecorder?.stop();
     logOverlay?.dispose();
     await context?.close().catch(() => undefined);
     await browser?.close().catch(() => undefined);
@@ -662,4 +673,3 @@ function normalizeUrl(url: string): string {
     return url;
   }
 }
-

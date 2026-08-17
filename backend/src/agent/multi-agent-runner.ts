@@ -15,6 +15,7 @@ import {
   getHtmlDir,
   getPagesDir,
   getApiDir,
+  getHarDir,
   writeJson,
   writeText,
   urlToFilename,
@@ -163,6 +164,7 @@ export async function runCollaborativeCrawl(options: CollaborativeCrawlOptions):
     const htmlDir = getHtmlDir(projectSlug, session.id);
     const pagesDir = getPagesDir(projectSlug, session.id);
     const apiDir = getApiDir(projectSlug, session.id);
+    const harDir = getHarDir(projectSlug, session.id);
 
     logger.info('[Collab] Starting collaborative crawl — BFS + LLM agents running concurrently');
 
@@ -194,9 +196,9 @@ export async function runCollaborativeCrawl(options: CollaborativeCrawlOptions):
     logger.info(`[Collab] Starting both agents from: ${postLoginUrl}`);
 
     await Promise.all([
-      runBfsAgent(state, bfsContext!, session.id, projectSlug, screenshotsDir, htmlDir, pagesDir, apiDir, project),
+      runBfsAgent(state, bfsContext!, session.id, projectSlug, screenshotsDir, htmlDir, pagesDir, apiDir, harDir, project),
       isLLMConfigured(llmConfig)
-        ? runLlmAgent(state, llmContext!, session.id, projectSlug, screenshotsDir, htmlDir, pagesDir, apiDir, project, llmConfig!, postLoginUrl)
+        ? runLlmAgent(state, llmContext!, session.id, projectSlug, screenshotsDir, htmlDir, pagesDir, apiDir, harDir, project, llmConfig!, postLoginUrl)
         : Promise.resolve(),
     ]);
 
@@ -258,6 +260,7 @@ async function runBfsAgent(
   htmlDir: string,
   pagesDir: string,
   apiDir: string,
+  harDir: string,
   project: Project,
 ): Promise<void> {
   const page =
@@ -293,7 +296,7 @@ async function runBfsAgent(
     }
 
     idleCount = 0;
-    networkRecorder?.reset();
+    await networkRecorder?.reset();
     consoleErrors.length = 0;
 
     const { url, depth } = entry;
@@ -383,6 +386,8 @@ async function runBfsAgent(
       }
       if (newCount > 0) logger.debug(`[BFS] +${newCount} URLs queued`);
 
+      await networkRecorder?.flush();
+
       // Record knowledge for LLM agent to learn from
       state.recordPage(url, {
         title,
@@ -405,10 +410,13 @@ async function runBfsAgent(
         state.recordModule(extractedData.navigation.currentModule);
       }
 
-      // Save network calls
+      // Save network calls + per-page HAR
       const calls = networkRecorder?.getCalls() ?? [];
-      if (calls.length > 0) {
+      if (networkRecorder) {
         writeJson(path.join(apiDir, urlToFilename(url, '-api.json')), calls);
+        writeJson(path.join(harDir, urlToFilename(url, '.har')), networkRecorder.getHar(url));
+      }
+      if (calls.length > 0) {
         await prisma.networkCall.createMany({
           data: calls.map(c => ({
             crawlSessionId: sessionId,
@@ -467,7 +475,7 @@ async function runBfsAgent(
   }
 
   state.bfsDone = true;
-  networkRecorder?.stop();
+  await networkRecorder?.stop();
   logger.info(`[BFS] Agent finished. Pages: ${state.stats.bfsPages}`);
 }
 
@@ -482,6 +490,7 @@ async function runLlmAgent(
   htmlDir: string,
   pagesDir: string,
   apiDir: string,
+  harDir: string,
   project: Project,
   llmConfig: LLMConfig,
   startUrl?: string,
@@ -525,7 +534,7 @@ async function runLlmAgent(
     }
 
     idleCount = 0;
-    networkRecorder?.reset();
+    await networkRecorder?.reset();
     const { url, depth, needsDeep } = entry;
 
     if (!isUrlSafe(url, allowedDomains, excludedUrls)) {
@@ -552,11 +561,11 @@ async function runLlmAgent(
       const title = await page.title().catch(() => '');
 
       // Capture base state of the page
-      await capturePage(page, url, title, sessionId, pageCapture?.id, screenshotsDir, htmlDir, pagesDir, apiDir, project, networkRecorder, state);
+      await capturePage(page, url, title, sessionId, pageCapture?.id, screenshotsDir, htmlDir, pagesDir, apiDir, harDir, project, networkRecorder, state);
 
       // If deep explore: use LLM to click through tabs/panels
       if (needsDeep) {
-        await deepExplore(page, url, depth, state, llm, project.name, sessionId, pageCapture?.id, screenshotsDir, htmlDir, pagesDir, apiDir, project, networkRecorder);
+        await deepExplore(page, url, depth, state, llm, project.name, sessionId, pageCapture?.id, screenshotsDir, htmlDir, pagesDir, apiDir, harDir, project, networkRecorder);
       } else {
         // Standard LLM navigation: pick next action on this page
         const pageState = await observePage(page).catch(() => null);
@@ -637,6 +646,8 @@ async function runLlmAgent(
         }
       }
 
+      await networkRecorder?.flush();
+
       // Record knowledge
       const extractedData = await extractPageData(page, url, []).catch(() => null);
       state.recordPage(url, {
@@ -695,7 +706,7 @@ async function runLlmAgent(
   }
 
   state.llmDone = true;
-  networkRecorder?.stop();
+  await networkRecorder?.stop();
   await page.close().catch(() => undefined);
   logger.info(`[LLM] Agent finished. Pages: ${state.stats.llmPages}, LLM-discovered URLs: ${state.stats.urlsAddedByLLM}, planner calls: ${plannerCallCount}`);
 }
@@ -715,6 +726,7 @@ async function deepExplore(
   htmlDir: string,
   pagesDir: string,
   apiDir: string,
+  harDir: string,
   project: Project,
   networkRecorder: ReturnType<typeof createNetworkRecorder> | null,
 ): Promise<void> {
@@ -791,6 +803,7 @@ async function capturePage(
   htmlDir: string,
   pagesDir: string,
   apiDir: string,
+  harDir: string,
   project: Project,
   networkRecorder: ReturnType<typeof createNetworkRecorder> | null,
   _state: SharedCrawlState,
@@ -824,9 +837,13 @@ async function capturePage(
     }).catch(() => undefined);
   }
 
+  await networkRecorder?.flush();
   const calls = networkRecorder?.getCalls() ?? [];
-  if (calls.length > 0 && pageCaptureId) {
+  if (networkRecorder) {
     writeJson(path.join(apiDir, urlToFilename(url, '-api.json')), calls);
+    writeJson(path.join(harDir, urlToFilename(url, '.har')), networkRecorder.getHar(url));
+  }
+  if (calls.length > 0 && pageCaptureId) {
     await prisma.networkCall.createMany({
       data: calls.map(c => ({
         crawlSessionId: sessionId, pageCaptureId,

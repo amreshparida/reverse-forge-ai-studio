@@ -43,7 +43,7 @@ reverse-engineering-ai/
 │   │   │   ├── workflow.ts     # Workflow state machine inference
 │   │   │   └── permissions.ts  # Permission matrix inference
 │   │   ├── recorder/           # Network call recording
-│   │   │   └── index.ts        # XHR/fetch/WebSocket capture
+│   │   │   └── index.ts        # XHR/fetch/WebSocket + per-page HAR 1.2
 │   │   ├── queue/              # Job queue
 │   │   │   └── job-queue.ts    # In-memory job queue with SSE events
 │   │   ├── database/           # Prisma client
@@ -102,7 +102,8 @@ User starts crawl
     │   ├─ extractPageData() → browser-extract.js
     │   ├─ extractJsIntelligence() → js-intel.js
     │   ├─ Advanced captures: source maps, IndexedDB, mobile viewport
-    │   ├─ networkRecorder.getCalls() → save to DB + files
+    │   ├─ networkRecorder.getCalls() → save to DB + api/*-api.json
+    │   ├─ networkRecorder.getHar() → save har/*.har (HAR 1.2 waterfall)
     │   └─ discoverLinks() → add new URLs to queue
     │
     └─ Session-level: OpenAPI probe, GraphQL introspection,

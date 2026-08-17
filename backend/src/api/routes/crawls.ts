@@ -5,6 +5,7 @@ import { jobQueue } from '../../queue/job-queue';
 import { runCrawl } from '../../crawler';
 import { runAgentCrawl } from '../../agent/runner';
 import { runCollaborativeCrawl } from '../../agent/multi-agent-runner';
+import { runManualCrawl } from '../../crawler/manual';
 import { analyzeSession } from '../../ai/analyzer';
 import { getProjectGenerationStatus, runReportGeneration } from '../../generators/generation-runner';
 import { readCheckpoint } from '../../generators/checkpoint';
@@ -16,6 +17,7 @@ import { removeDir } from '../../utils/file-system';
 import type { LLMConfig } from '../../ai/llm';
 
 export const crawlsRouter = Router({ mergeParams: true });
+const ACTIVE_CRAWL_STATUSES = ['pending', 'awaiting_login', 'running'] as const;
 
 // ── Literal routes first (must come before /:sessionId) ──────────────────
 
@@ -41,7 +43,7 @@ crawlsRouter.post('/', async (req: Request, res: Response, next: NextFunction) =
     if (!project) return res.status(404).json({ error: 'Project not found' });
 
     const running = await prisma.crawlSession.findFirst({
-      where: { projectId, status: 'running' },
+      where: { projectId, status: { in: [...ACTIVE_CRAWL_STATUSES] } },
     });
     if (running) {
       return res.status(409).json({ error: 'A crawl is already running for this project', sessionId: running.id });
@@ -63,6 +65,32 @@ crawlsRouter.post('/', async (req: Request, res: Response, next: NextFunction) =
   }
 });
 
+// POST /api/projects/:projectId/crawls/manual — human-guided headed-browser capture
+crawlsRouter.post('/manual', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { projectId } = req.params;
+    const project = await prisma.project.findUnique({ where: { id: projectId } });
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+
+    const active = await prisma.crawlSession.findFirst({
+      where: { projectId, status: { in: [...ACTIVE_CRAWL_STATUSES] } },
+    });
+    if (active) {
+      return res.status(409).json({ error: 'A crawl is already active for this project', sessionId: active.id });
+    }
+
+    const session = await prisma.crawlSession.create({ data: { projectId, status: 'pending' } });
+    await jobQueue.addJob(
+      'manual-crawl',
+      { projectId, sessionId: session.id, projectSlug: project.slug },
+      `manual-${session.id}`,
+    );
+    res.status(202).json({ session, mode: 'manual' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // POST /api/projects/:projectId/crawls/collaborative — BFS + LLM agents run together
 crawlsRouter.post('/collaborative', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -70,7 +98,9 @@ crawlsRouter.post('/collaborative', async (req: Request, res: Response, next: Ne
     const project = await prisma.project.findUnique({ where: { id: projectId } });
     if (!project) return res.status(404).json({ error: 'Project not found' });
 
-    const running = await prisma.crawlSession.findFirst({ where: { projectId, status: 'running' } });
+    const running = await prisma.crawlSession.findFirst({
+      where: { projectId, status: { in: [...ACTIVE_CRAWL_STATUSES] } },
+    });
     if (running) return res.status(409).json({ error: 'A crawl is already running', sessionId: running.id });
 
     const session = await prisma.crawlSession.create({ data: { projectId, status: 'pending' } });
@@ -102,7 +132,9 @@ crawlsRouter.post('/agent', async (req: Request, res: Response, next: NextFuncti
       return res.status(400).json({ error: 'Agent crawl requires LLM_API_KEY to be configured' });
     }
 
-    const running = await prisma.crawlSession.findFirst({ where: { projectId, status: 'running' } });
+    const running = await prisma.crawlSession.findFirst({
+      where: { projectId, status: { in: [...ACTIVE_CRAWL_STATUSES] } },
+    });
     if (running) return res.status(409).json({ error: 'A crawl is already running', sessionId: running.id });
 
     const session = await prisma.crawlSession.create({ data: { projectId, status: 'pending' } });
@@ -241,6 +273,7 @@ crawlsRouter.get('/:sessionId', async (req: Request, res: Response, next: NextFu
       jobQueue.getJob(`crawl-${req.params['sessionId']}`) ??
       jobQueue.getJob(`agent-${req.params['sessionId']}`) ??
       jobQueue.getJob(`collab-${req.params['sessionId']}`) ??
+      jobQueue.getJob(`manual-${req.params['sessionId']}`) ??
       jobQueue.getJob(`report-${req.params['sessionId']}`) ??
       jobQueue.getJob(`project-report-${req.params['projectId']}`);
     res.json({ session, job: job ? { id: job.id, type: job.type, status: job.status, progress: job.progress } : null });
@@ -266,7 +299,7 @@ crawlsRouter.post('/:sessionId/stop', async (req: Request, res: Response, next: 
     const { sessionId } = req.params;
 
     // Cancel every crawl job id variant (BFS / agent / xpert)
-    for (const jobId of [`crawl-${sessionId}`, `agent-${sessionId}`, `collab-${sessionId}`]) {
+    for (const jobId of [`crawl-${sessionId}`, `agent-${sessionId}`, `collab-${sessionId}`, `manual-${sessionId}`]) {
       await jobQueue.cancelJob(jobId).catch(() => undefined);
     }
 
@@ -352,7 +385,7 @@ crawlsRouter.delete('/:sessionId', async (req: Request, res: Response, next: Nex
       });
     }
 
-    for (const jobId of [`crawl-${sessionId}`, `agent-${sessionId}`, `collab-${sessionId}`, `report-${sessionId}`]) {
+    for (const jobId of [`crawl-${sessionId}`, `agent-${sessionId}`, `collab-${sessionId}`, `manual-${sessionId}`, `report-${sessionId}`]) {
       await jobQueue.cancelJob(jobId).catch(() => undefined);
     }
 
@@ -431,6 +464,38 @@ crawlsRouter.post('/:sessionId/generate-report', async (req: Request, res: Respo
 
 // Register job handlers
 export function registerJobHandlers(): void {
+  jobQueue.registerHandler<{ projectId: string; sessionId: string; projectSlug: string }>(
+    'manual-crawl',
+    async (job, updateProgress) => {
+      const { projectId, sessionId, projectSlug } = job.data;
+      const project = await prisma.project.findUniqueOrThrow({ where: { id: projectId } });
+      const session = await prisma.crawlSession.findUniqueOrThrow({ where: { id: sessionId } });
+      const abortSignal = crawlAbortRegistry.begin(sessionId);
+      emitCrawlLog(sessionId, 'info', 'Manual crawl browser started', { project: project.name });
+      try {
+        await runManualCrawl({
+          project,
+          session,
+          projectSlug,
+          abortSignal,
+          onProgress: (info) => {
+            // Manual sessions have no predetermined page count; keep active progress below completion.
+            updateProgress(Math.min(90, info.capturedCount * 5));
+            emitCrawlLog(sessionId, 'info', info.message, {
+              capturedCount: info.capturedCount,
+              currentUrl: info.currentUrl,
+              status: info.status,
+            });
+          },
+        });
+        updateProgress(100);
+        emitCrawlLog(sessionId, 'info', 'Manual crawl completed');
+      } finally {
+        crawlAbortRegistry.end(sessionId);
+      }
+    },
+  );
+
   jobQueue.registerHandler<{ projectId: string; sessionId: string; projectSlug: string }>(
     'crawl',
     async (job, updateProgress) => {

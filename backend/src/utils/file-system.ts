@@ -33,6 +33,10 @@ export function getApiDir(projectSlug: string, sessionId: string): string {
   return ensureDir(path.join(config.outputDir, projectSlug, sessionId, 'api'));
 }
 
+export function getHarDir(projectSlug: string, sessionId: string): string {
+  return ensureDir(path.join(config.outputDir, projectSlug, sessionId, 'har'));
+}
+
 export function getAnalysisDir(projectSlug: string, sessionId: string): string {
   return ensureDir(path.join(config.outputDir, projectSlug, sessionId, 'analysis'));
 }

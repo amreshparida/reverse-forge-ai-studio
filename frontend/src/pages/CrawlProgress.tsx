@@ -75,7 +75,7 @@ export default function CrawlProgress() {
 
   // SSE for job progress
   useEffect(() => {
-    const jobIds = new Set([`crawl-${sessionId}`, `agent-${sessionId}`, `collab-${sessionId}`, `report-${sessionId}`]);
+    const jobIds = new Set([`crawl-${sessionId}`, `agent-${sessionId}`, `collab-${sessionId}`, `manual-${sessionId}`, `report-${sessionId}`]);
     const evtSource = new EventSource('/api/events');
     evtSource.addEventListener('job', (e) => {
       const j = JSON.parse(e.data) as Job;
@@ -198,11 +198,18 @@ export default function CrawlProgress() {
             <ol className="text-sm text-amber-700 space-y-1 list-decimal list-inside">
               <li>A browser window has opened at your login page.</li>
               <li>Fill in your credentials and log in normally.</li>
-              <li>Once logged in, click the <strong className="bg-indigo-600 text-white px-2 py-0.5 rounded text-xs">✓ Done — Start Crawling</strong> button in the browser.</li>
+              <li>
+                Once logged in, click the{' '}
+                <strong className="bg-indigo-600 text-white px-2 py-0.5 rounded text-xs">
+                  {job?.type === 'manual-crawl' ? 'Start capture' : '✓ Done — Start Crawling'}
+                </strong>{' '}
+                button in the browser.
+              </li>
             </ol>
             <p className="text-xs text-amber-600 mt-2">
-              The crawl will start automatically after you click that button.
-              For <strong>XpertCrawl</strong>, both agents will start from that same page.
+              {job?.type === 'manual-crawl'
+                ? 'Then explore normally. New URLs are captured automatically; use Capture current state for tabs and modals, and Finish & save when done.'
+                : <>The crawl will start automatically after you click that button. For <strong>XpertCrawl</strong>, both agents will start from that same page.</>}
             </p>
           </div>
         )}
@@ -210,8 +217,12 @@ export default function CrawlProgress() {
         {isRunning && !isAwaitingLogin && (
           <div className="mt-4 flex items-center gap-2">
             <div className="animate-pulse w-2 h-2 bg-blue-500 rounded-full" />
-            <span className="text-sm text-blue-600">Crawling in progress...</span>
-          </div>
+            <span className="text-sm text-blue-600">
+              {job?.type === 'manual-crawl'
+                ? 'Manual capture is active in the browser. Explore normally, capture dynamic states, then click Finish & save.'
+                : 'Crawling in progress...'}
+            </span>
+            </div>
         )}
       </div>
 
@@ -304,4 +315,3 @@ export default function CrawlProgress() {
     </div>
   );
 }
-

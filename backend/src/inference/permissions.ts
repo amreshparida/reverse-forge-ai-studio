@@ -2,7 +2,7 @@ import { prisma } from '../database/client';
 import { config } from '../config';
 import { createLLMClient, isLLMConfigured, type LLMConfig } from '../ai/llm';
 import { buildPermissionMatrixPrompt } from '../ai/prompts';
-import { getSessionAnalyses, getProjectAnalyses } from '../ai/analyzer';
+import { getSessionAnalyses, getProjectAnalyses, getAnalysesForSessions } from '../ai/analyzer';
 import { materializePageAnalysisWorkspace } from '../ai/synthesis-workspace';
 import { runSynthesisAgent } from '../ai/synthesis-agent';
 import { writeJson } from '../utils/file-system';
@@ -49,8 +49,11 @@ export async function inferPermissions(
   llmConfig?: LLMConfig,
   appName?: string,
   projectId?: string,
+  sourceSessionIds?: string[],
 ): Promise<PermissionMatrix> {
-  const allAnalyses = projectId ? await getProjectAnalyses(projectId) : [];
+  const allAnalyses = sourceSessionIds?.length
+    ? await getAnalysesForSessions(sourceSessionIds)
+    : projectId ? await getProjectAnalyses(projectId) : [];
   const sessionAnalyses = allAnalyses.length > 0 ? allAnalyses : await getSessionAnalyses(sessionId);
 
   if (isLLMConfigured(llmConfig) && sessionAnalyses.length > 0 && projectId) {
@@ -63,6 +66,7 @@ export async function inferPermissions(
           projectId,
           projectSlug,
           sessionId,
+          sourceSessionIds,
         });
         writeJson(path.join(workspace.root, 'entity-model.json'), { entities });
 

@@ -1,9 +1,11 @@
 import fs from 'fs';
 import path from 'path';
+import { createHash } from 'crypto';
 import { prisma } from '../database/client';
-import { ensureDir, writeJson, readJson, getReportsDir, urlToFilename } from '../utils/file-system';
+import { ensureDir, writeJson, readJson, getReportsDir, getHarDir, urlToFilename } from '../utils/file-system';
 import { logger } from '../utils/logger';
 import type { PageAnalysisResult } from './analyzer';
+import { isHarLog } from './har-summary';
 
 export interface PageAnalysisIndexEntry {
   id: string;
@@ -13,6 +15,7 @@ export interface PageAnalysisIndexEntry {
   module: string | null;
   entity: string | null;
   workflowStage: string | null;
+  sourceSessionId: string;
 }
 
 export interface NetworkCallIndexEntry {
@@ -23,6 +26,16 @@ export interface NetworkCallIndexEntry {
   status: number | null;
   resourceType: string | null;
   isGraphQL: boolean;
+  sourceSessionId: string;
+}
+
+export interface HarIndexEntry {
+  id: string;
+  file: string;
+  pageUrl: string;
+  entryCount: number;
+  sourceSessionId: string;
+  sourceHarFile: string;
 }
 
 export interface GraphChunkIndexEntry {
@@ -36,10 +49,12 @@ export interface SynthesisWorkspace {
   root: string;
   pageAnalysesDir: string;
   networkCallsDir: string;
+  harDir: string;
   graphChunksDir: string;
   indexPath: string;
   index: PageAnalysisIndexEntry[];
   networkIndex: NetworkCallIndexEntry[];
+  harIndex: HarIndexEntry[];
   graphChunkIndex: GraphChunkIndexEntry[];
 }
 
@@ -79,6 +94,18 @@ function clearDir(dir: string): void {
   }
 }
 
+function hashText(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function fingerprintFiles(root: string, entries: Array<{ id: string; file: string }>): string {
+  const hashes = entries.map((entry) => {
+    const data = fs.readFileSync(path.join(root, entry.file));
+    return `${entry.id}:${data.length}:${createHash('sha256').update(data).digest('hex')}`;
+  });
+  return hashText(hashes.sort().join('\n'));
+}
+
 /**
  * Export all project page AI analyses onto disk for tool-using agents.
  */
@@ -86,6 +113,7 @@ export async function materializePageAnalysisWorkspace(args: {
   projectId: string;
   projectSlug: string;
   sessionId: string;
+  sourceSessionIds?: string[];
 }): Promise<SynthesisWorkspace> {
   return materializeEvidenceWorkspace({ ...args, includeNetworkCalls: false, includeGraphChunks: false });
 }
@@ -105,21 +133,39 @@ export async function materializeEvidenceWorkspace(args: {
   graphChunkSize?: number;
 }): Promise<SynthesisWorkspace> {
   const root = getSynthesisWorkspaceDir(args.projectSlug, args.sessionId);
+  const priorIndex = readJson<{
+    fingerprints?: { pages?: string; networkCalls?: string; harFiles?: string; graphChunks?: string };
+  }>(path.join(root, 'EVIDENCE-INDEX.json'));
+  const sourceSessionIds = [...new Set(args.sourceSessionIds?.length ? args.sourceSessionIds : [args.sessionId])].sort();
+  const validSessions = await prisma.crawlSession.findMany({
+    where: { id: { in: sourceSessionIds }, projectId: args.projectId },
+    select: { id: true },
+  });
+  const validSessionIds = new Set(validSessions.map((session) => session.id));
+  const invalidSessionIds = sourceSessionIds.filter((id) => !validSessionIds.has(id));
+  if (invalidSessionIds.length > 0) {
+    throw new Error(`Evidence source sessions do not belong to project ${args.projectId}: ${invalidSessionIds.join(', ')}`);
+  }
   const pageAnalysesDir = ensureDir(path.join(root, 'page-analyses'));
   const networkCallsDir = ensureDir(path.join(root, 'network-calls'));
+  const harDir = ensureDir(path.join(root, 'har'));
   const graphChunksDir = ensureDir(path.join(root, 'graph-chunks'));
 
   clearDir(pageAnalysesDir);
-  if (args.includeNetworkCalls) clearDir(networkCallsDir);
+  if (args.includeNetworkCalls) {
+    clearDir(networkCallsDir);
+    clearDir(harDir);
+  }
   if (args.includeGraphChunks) clearDir(graphChunksDir);
 
   const pages = await prisma.pageCapture.findMany({
     where: {
       aiAnalysis: { not: null },
-      crawlSession: { projectId: args.projectId },
+      crawlSessionId: { in: sourceSessionIds },
     },
-    select: { id: true, url: true, title: true, aiAnalysis: true },
-    orderBy: { createdAt: 'asc' },
+    select: { id: true, url: true, title: true, aiAnalysis: true, crawlSessionId: true },
+    // Prefer the newest capture when the same URL exists in multiple selected sessions.
+    orderBy: { createdAt: 'desc' },
   });
 
   const seenUrls = new Set<string>();
@@ -145,6 +191,7 @@ export async function materializeEvidenceWorkspace(args: {
       url: page.url,
       title: page.title,
       analysis,
+      sourceSessionId: page.crawlSessionId,
     });
 
     index.push({
@@ -155,6 +202,7 @@ export async function materializeEvidenceWorkspace(args: {
       module: analysis.businessModule ?? null,
       entity: analysis.primaryEntity ?? null,
       workflowStage: analysis.workflowStage ?? null,
+      sourceSessionId: page.crawlSessionId,
     });
   }
 
@@ -165,9 +213,8 @@ export async function materializeEvidenceWorkspace(args: {
 
   const networkIndex: NetworkCallIndexEntry[] = [];
   if (args.includeNetworkCalls) {
-    const sessionIds = args.sourceSessionIds?.length ? args.sourceSessionIds : [args.sessionId];
     const calls = await prisma.networkCall.findMany({
-      where: { crawlSessionId: { in: sessionIds } },
+      where: { crawlSessionId: { in: sourceSessionIds } },
       orderBy: { createdAt: 'asc' },
       select: {
         id: true,
@@ -184,13 +231,14 @@ export async function materializeEvidenceWorkspace(args: {
         isGraphQL: true,
         graphQLOperationName: true,
         timingMs: true,
+        crawlSessionId: true,
       },
     });
 
     // Deduplicate noisy identical method+url+status rows but keep payload variants
     const seen = new Set<string>();
     for (const call of calls) {
-      const key = `${call.method}|${call.url}|${call.responseStatus}|${(call.responseSchemaKeys ?? '').slice(0, 80)}|${(call.requestPayload ?? '').slice(0, 80)}`;
+      const key = `${call.crawlSessionId}|${call.method}|${call.url}|${call.responseStatus}|${(call.responseSchemaKeys ?? '').slice(0, 80)}|${(call.requestPayload ?? '').slice(0, 80)}`;
       if (seen.has(key)) continue;
       seen.add(key);
 
@@ -207,12 +255,52 @@ export async function materializeEvidenceWorkspace(args: {
         status: call.responseStatus,
         resourceType: call.resourceType,
         isGraphQL: Boolean(call.isGraphQL),
+        sourceSessionId: call.crawlSessionId,
       });
     }
 
     writeJson(path.join(networkCallsDir, 'index.json'), {
       count: networkIndex.length,
       calls: networkIndex,
+    });
+  }
+
+  const harIndex: HarIndexEntry[] = [];
+  if (args.includeNetworkCalls) {
+    for (const sid of sourceSessionIds) {
+      const sessionHarDir = getHarDir(args.projectSlug, sid);
+      if (!fs.existsSync(sessionHarDir)) continue;
+      for (const name of fs.readdirSync(sessionHarDir).filter((f) => f.endsWith('.har')).sort()) {
+        try {
+          const absSrc = path.join(sessionHarDir, name);
+          const raw = JSON.parse(fs.readFileSync(absSrc, 'utf-8')) as unknown;
+          if (!isHarLog(raw)) continue;
+          const pageUrl = raw.log.pages[0]?.title || name;
+          const n = harIndex.length + 1;
+          const file = `${String(n).padStart(3, '0')}_${safeWorkspaceFileBase(pageUrl || name, 100)}.har`.slice(0, 180);
+          const id = path.basename(file, '.har');
+          // Full HAR 1.2 — same payload as session capture (like network-calls/*.json)
+          writeJson(path.join(harDir, file), { ...raw, id, sourceSessionId: sid, sourceHarFile: name });
+          harIndex.push({
+            id,
+            file,
+            pageUrl,
+            entryCount: raw.log.entries.length,
+            sourceSessionId: sid,
+            sourceHarFile: name,
+          });
+        } catch (err) {
+          logger.warn(
+            `[SynthesisWorkspace] Skipping HAR ${name}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    }
+
+    writeJson(path.join(harDir, 'index.json'), {
+      count: harIndex.length,
+      hars: harIndex,
+      note: 'Full per-page HAR 1.2 captures (same content as session har/*.har)',
     });
   }
 
@@ -249,24 +337,55 @@ export async function materializeEvidenceWorkspace(args: {
       chunks: graphChunkIndex,
     });
 
-    // Chunk set was rebuilt — invalidate prior graph coverage so IDs stay consistent
-    const covPath = path.join(root, 'coverage-state.json');
-    const cov = readJson<{ pagesRead: string[]; apisRead: string[]; graphChunksRead: string[] }>(covPath) ?? {
-      pagesRead: [],
-      apisRead: [],
-      graphChunksRead: [],
-    };
-    writeJson(covPath, { ...cov, graphChunksRead: [] });
   }
 
   const indexPath = path.join(root, 'EVIDENCE-INDEX.json');
+  const fingerprints = {
+    pages: fingerprintFiles(pageAnalysesDir, index),
+    networkCalls: args.includeNetworkCalls
+      ? fingerprintFiles(networkCallsDir, networkIndex)
+      : priorIndex?.fingerprints?.networkCalls ?? hashText(''),
+    harFiles: args.includeNetworkCalls
+      ? fingerprintFiles(harDir, harIndex)
+      : priorIndex?.fingerprints?.harFiles ?? hashText(''),
+    graphChunks: args.includeGraphChunks
+      ? fingerprintFiles(graphChunksDir, graphChunkIndex)
+      : priorIndex?.fingerprints?.graphChunks ?? hashText(''),
+  };
+  const coveragePath = path.join(root, 'coverage-state.json');
+  const coverage = readJson<{ pagesRead?: string[]; apisRead?: string[]; harsRead?: string[]; graphChunksRead?: string[] }>(coveragePath) ?? {};
+  const pageEvidenceChanged = priorIndex?.fingerprints?.pages !== fingerprints.pages;
+  const networkEvidenceChanged = args.includeNetworkCalls
+    && priorIndex?.fingerprints?.networkCalls !== fingerprints.networkCalls;
+  const harEvidenceChanged = args.includeNetworkCalls
+    && priorIndex?.fingerprints?.harFiles !== fingerprints.harFiles;
+  const graphEvidenceChanged = args.includeGraphChunks
+    && priorIndex?.fingerprints?.graphChunks !== fingerprints.graphChunks;
+  writeJson(coveragePath, {
+    pagesRead: pageEvidenceChanged ? [] : coverage.pagesRead ?? [],
+    apisRead: networkEvidenceChanged ? [] : coverage.apisRead ?? [],
+    harsRead: harEvidenceChanged ? [] : coverage.harsRead ?? [],
+    graphChunksRead: graphEvidenceChanged ? [] : coverage.graphChunksRead ?? [],
+  });
+  if (pageEvidenceChanged) {
+    for (const name of ['working-notes.json', 'shared-evidence-meta.json']) {
+      const target = path.join(root, name);
+      if (fs.existsSync(target)) fs.unlinkSync(target);
+    }
+  }
+
   writeJson(indexPath, {
     projectId: args.projectId,
     projectSlug: args.projectSlug,
     sessionId: args.sessionId,
+    sourceSessionIds,
+    generatedAt: new Date().toISOString(),
     pages: index.length,
     networkCalls: networkIndex.length,
+    harFiles: harIndex.length,
     graphChunks: graphChunkIndex.length,
+    fingerprints,
+    fingerprint: hashText(JSON.stringify({ sourceSessionIds, fingerprints })),
   });
 
   writeJson(path.join(root, 'MANIFEST.json'), {
@@ -275,7 +394,8 @@ export async function materializeEvidenceWorkspace(args: {
       'Entity drains all pages into working-notes.json. Later stages reuse coverage-state + notes and must not re-read pages unless unread>0. write_artifact blocked until required coverage is complete.',
     layout: {
       'page-analyses/': 'Full page AI analyses',
-      'network-calls/': 'Network/API captures',
+      'network-calls/': 'Network/API captures (xhr/fetch)',
+      'har/': 'Full per-page HAR 1.2 captures',
       'graph-chunks/': 'Shared analysis graph partitions',
       'working-notes.json': 'Shared durable notes (seeded by entity, reused by later stages)',
       'coverage-state.json': 'Read coverage tracker (pages persist across stages)',
@@ -284,17 +404,19 @@ export async function materializeEvidenceWorkspace(args: {
   });
 
   logger.info(
-    `[SynthesisWorkspace] Evidence ready: ${index.length} pages, ${networkIndex.length} APIs, ${graphChunkIndex.length} graph chunks → ${root}`,
+    `[SynthesisWorkspace] Evidence ready: ${index.length} pages, ${networkIndex.length} APIs, ${harIndex.length} HAR files, ${graphChunkIndex.length} graph chunks → ${root}`,
   );
 
   return {
     root,
     pageAnalysesDir,
     networkCallsDir,
+    harDir,
     graphChunksDir,
     indexPath,
     index,
     networkIndex,
+    harIndex,
     graphChunkIndex,
   };
 }

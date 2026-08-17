@@ -10,6 +10,11 @@ import { logger } from '../../utils/logger';
 
 export const projectsRouter = Router();
 
+function redactProjectSecret<T extends { llmApiKey?: string | null }>(project: T) {
+  const { llmApiKey, ...safeProject } = project;
+  return { ...safeProject, llmApiKeyConfigured: Boolean(llmApiKey) };
+}
+
 const CreateProjectSchema = z.object({
   name: z.string().min(1).max(100),
   baseUrl: z.string().url(),
@@ -36,7 +41,7 @@ projectsRouter.get('/', async (_req: Request, res: Response, next: NextFunction)
         _count: { select: { crawlSessions: true } },
       },
     });
-    res.json({ projects });
+    res.json({ projects: projects.map(redactProjectSecret) });
   } catch (err) {
     next(err);
   }
@@ -58,7 +63,7 @@ projectsRouter.post('/', async (req: Request, res: Response, next: NextFunction)
       },
     });
 
-    res.status(201).json({ project });
+    res.status(201).json({ project: redactProjectSecret(project) });
   } catch (err) {
     next(err);
   }
@@ -102,7 +107,7 @@ projectsRouter.post('/:id/clone', async (req: Request, res: Response, next: Next
     });
 
     logger.info(`Project cloned: ${source.name} → ${project.name} [${source.id} → ${project.id}]`);
-    res.status(201).json({ project });
+    res.status(201).json({ project: redactProjectSecret(project) });
   } catch (err) {
     next(err);
   }
@@ -121,7 +126,7 @@ projectsRouter.get('/:id', async (req: Request, res: Response, next: NextFunctio
       },
     });
     if (!project) return res.status(404).json({ error: 'Project not found' });
-    res.json({ project });
+    res.json({ project: redactProjectSecret(project) });
   } catch (err) {
     next(err);
   }
@@ -140,7 +145,7 @@ projectsRouter.put('/:id', async (req: Request, res: Response, next: NextFunctio
       where: { id: req.params['id'] },
       data,
     });
-    res.json({ project });
+    res.json({ project: redactProjectSecret(project) });
   } catch (err) {
     next(err);
   }

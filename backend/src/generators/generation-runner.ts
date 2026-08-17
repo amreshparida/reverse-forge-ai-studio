@@ -26,6 +26,8 @@ import {
 import type { LLMConfig } from '../ai/llm';
 import { logger } from '../utils/logger';
 import { jobQueue } from '../queue/job-queue';
+import { fileExists } from '../utils/file-system';
+import { prisma } from '../database/client';
 
 export interface RunGenerationArgs {
   projectId: string;
@@ -114,6 +116,15 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
     resume = false,
   } = args;
 
+  const uniqueSourceIds = [...new Set(sourceSessionIds)];
+  if (uniqueSourceIds.length === 0) throw new Error('At least one source session is required');
+  const validSources = await prisma.crawlSession.count({
+    where: { id: { in: uniqueSourceIds }, projectId },
+  });
+  if (validSources !== uniqueSourceIds.length) {
+    throw new Error('One or more source sessions do not belong to the requested project');
+  }
+
   let checkpoint: GenerationCheckpoint;
 
   if (resume) {
@@ -123,6 +134,16 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
     }
     if (existing.status === 'completed') {
       throw new Error('Generation already completed — start a new extract to regenerate');
+    }
+    const requestedSources = [...new Set(sourceSessionIds)].sort();
+    const checkpointSources = [...new Set(existing.sourceSessionIds)].sort();
+    if (
+      existing.projectId !== projectId ||
+      existing.projectSlug !== projectSlug ||
+      existing.sessionId !== sessionId ||
+      JSON.stringify(checkpointSources) !== JSON.stringify(requestedSources)
+    ) {
+      throw new Error('Checkpoint provenance does not match the requested project/report/source sessions');
     }
     checkpoint = writeCheckpoint({
       ...existing,
@@ -153,8 +174,21 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
     // ── 1. Page analysis ────────────────────────────────────────────────
     if (!isStageCompleted(checkpoint, 'page-analysis')) {
       checkpoint = await beginStage(checkpoint, 'page-analysis', 'Analysis agent: page-by-page AI analysis', args);
+      const failedPages: Array<{ sessionId: string; url: string; error: string }> = [];
       for (const sourceSessionId of sourceSessionIds) {
-        await analyzeSession(sourceSessionId, llmConfig, appName);
+        const result = await analyzeSession(sourceSessionId, llmConfig, appName);
+        failedPages.push(...result.failed.map((failure) => ({
+          sessionId: sourceSessionId,
+          url: failure.url,
+          error: failure.error,
+        })));
+      }
+      if (failedPages.length > 0) {
+        const examples = failedPages.slice(0, 3).map((failure) => failure.url).join(', ');
+        throw new Error(
+          `Page analysis incomplete: ${failedPages.length} page(s) failed after bounded retries` +
+            (examples ? ` (${examples})` : ''),
+        );
       }
       checkpoint = await completeStage(checkpoint, 'page-analysis', 'Page AI analysis complete', args);
     } else {
@@ -164,7 +198,7 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
     // ── 2. Entity inference ─────────────────────────────────────────────
     if (!isStageCompleted(checkpoint, 'entity-inference')) {
       checkpoint = await beginStage(checkpoint, 'entity-inference', 'Data model agent: entity inference', args);
-      entityModel = await inferEntities(sourceSessionIds[0] ?? sessionId, projectId, llmConfig, appName);
+      entityModel = await inferEntities(sourceSessionIds[0] ?? sessionId, projectId, llmConfig, appName, sourceSessionIds);
       const entityPath = saveStageArtifact(projectSlug, sessionId, 'entity-model.json', entityModel);
       checkpoint = await completeStage(
         checkpoint,
@@ -176,7 +210,7 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
     } else {
       entityModel = loadEntityModelArtifact(projectSlug, sessionId, checkpoint);
       if (!entityModel) {
-        entityModel = await inferEntities(sourceSessionIds[0] ?? sessionId, projectId, llmConfig, appName);
+        entityModel = await inferEntities(sourceSessionIds[0] ?? sessionId, projectId, llmConfig, appName, sourceSessionIds);
         const entityPath = saveStageArtifact(projectSlug, sessionId, 'entity-model.json', entityModel);
         checkpoint = writeCheckpoint({
           ...checkpoint,
@@ -195,6 +229,7 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
         entityModel!.entities,
         llmConfig,
         appName,
+        sourceSessionIds,
       );
       const workflowPath = saveStageArtifact(projectSlug, sessionId, 'workflow-model.json', workflowModel);
       checkpoint = await completeStage(
@@ -213,6 +248,7 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
           entityModel!.entities,
           llmConfig,
           appName,
+          sourceSessionIds,
         );
         const workflowPath = saveStageArtifact(projectSlug, sessionId, 'workflow-model.json', workflowModel);
         checkpoint = writeCheckpoint({
@@ -232,6 +268,7 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
         llmConfig,
         appName,
         projectId,
+        sourceSessionIds,
       );
       const permPath = saveStageArtifact(projectSlug, sessionId, 'permission-matrix.json', permissionMatrix);
       checkpoint = await completeStage(
@@ -250,6 +287,7 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
           llmConfig,
           appName,
           projectId,
+          sourceSessionIds,
         );
         const permPath = saveStageArtifact(projectSlug, sessionId, 'permission-matrix.json', permissionMatrix);
         checkpoint = writeCheckpoint({
@@ -263,11 +301,12 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
     // ── 5–9. Report assembly (graph → specialists → architecture → expert → write)
     const skipGraph = isStageCompleted(checkpoint, 'graph-indexing');
     const skipSpecialists = isStageCompleted(checkpoint, 'specialist-agents');
+    const skipDeepResearch = isStageCompleted(checkpoint, 'deep-research');
     const skipArchitecture = isStageCompleted(checkpoint, 'architecture-and-kg');
     const skipExpert = isStageCompleted(checkpoint, 'expert-analysis');
     const skipFinal = isStageCompleted(checkpoint, 'final-report');
 
-    if (skipFinal && checkpoint.reportPath) {
+    if (skipFinal && checkpoint.reportPath && fileExists(checkpoint.reportPath)) {
       const donePath = checkpoint.reportPath;
       checkpoint = markGenerationCompleted(checkpoint, donePath);
       emit(checkpoint, args.jobId);
@@ -291,6 +330,7 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
         resume: {
           skipGraphBuild: skipGraph,
           skipSpecialists,
+          skipDeepResearch,
           skipArchitecture,
           skipExpert,
         },

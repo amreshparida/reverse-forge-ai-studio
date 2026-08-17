@@ -11,6 +11,8 @@ The crawler is a **read-only observer**. It must never:
 
 This is enforced through three independent layers, so a single bypass cannot cause harm.
 
+Captured data is treated as sensitive. The API binds to loopback by default, requires an API token before remote binding, never returns stored project LLM keys, and masks credential-like headers, URL parameters, and nested payload keys before persistence. Recorder snapshots flush pending response handlers before writing a page window.
+
 ---
 
 ## Layer 1 — Text Pattern Matching

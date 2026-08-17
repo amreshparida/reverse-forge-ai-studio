@@ -18,6 +18,8 @@ function requireEnv(key: string, fallback?: string): string {
 
 export const config = {
   port: parseInt(process.env['PORT'] ?? '3001', 10),
+  // Local-only by default because captures and reports may contain sensitive application data.
+  host: process.env['HOST'] ?? '127.0.0.1',
   nodeEnv: process.env['NODE_ENV'] ?? 'development',
   outputDir: process.env['OUTPUT_DIR'] || path.join(BACKEND_ROOT, 'project-output'),
   sessionDir: process.env['SESSION_DIR'] || path.join(BACKEND_ROOT, 'sessions'),
@@ -62,11 +64,21 @@ export const config = {
     headless: process.env['CRAWL_HEADLESS'] !== 'false',
     /** Agentic crawl LLM action budget (steps ≠ unique pages) */
     agentMaxSteps: Math.max(1, parseInt(process.env['AGENT_MAX_STEPS'] ?? '150', 10) || 150),
+    /** Maximum duration for a human-guided crawl before it is finalized automatically. */
+    manualMaxDurationMs: Math.max(
+      60_000,
+      (parseInt(process.env['MANUAL_CRAWL_MAX_MINUTES'] ?? '240', 10) || 240) * 60_000,
+    ),
   },
 
   rateLimit: {
     windowMs: parseInt(process.env['RATE_LIMIT_WINDOW_MS'] ?? '60000', 10),
     max: parseInt(process.env['RATE_LIMIT_MAX'] ?? '100', 10),
+  },
+
+  security: {
+    /** Optional bearer/X-API-Key required for API and static evidence endpoints. */
+    apiAuthToken: process.env['API_AUTH_TOKEN'] || undefined,
   },
 
   isDev(): boolean {

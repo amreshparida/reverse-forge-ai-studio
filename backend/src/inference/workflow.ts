@@ -2,7 +2,7 @@ import { prisma } from '../database/client';
 import { config } from '../config';
 import { createLLMClient, isLLMConfigured, type LLMConfig } from '../ai/llm';
 import { buildWorkflowInferencePrompt } from '../ai/prompts';
-import { getSessionAnalyses, getProjectAnalyses } from '../ai/analyzer';
+import { getSessionAnalyses, getProjectAnalyses, getAnalysesForSessions } from '../ai/analyzer';
 import { materializePageAnalysisWorkspace, getSynthesisWorkspaceDir } from '../ai/synthesis-workspace';
 import { runSynthesisAgent } from '../ai/synthesis-agent';
 import { writeJson } from '../utils/file-system';
@@ -50,8 +50,11 @@ export async function inferWorkflows(
   entities: Entity[],
   llmConfig?: LLMConfig,
   appName?: string,
+  sourceSessionIds?: string[],
 ): Promise<WorkflowModel> {
-  const analyses = await getProjectAnalyses(projectId);
+  const analyses = sourceSessionIds?.length
+    ? await getAnalysesForSessions(sourceSessionIds)
+    : await getProjectAnalyses(projectId);
   const sessionAnalyses = analyses.length > 0 ? analyses : await getSessionAnalyses(sessionId);
   let workflowModel: WorkflowModel;
 
@@ -65,6 +68,7 @@ export async function inferWorkflows(
           projectId,
           projectSlug,
           sessionId,
+          sourceSessionIds,
         });
 
         // Ensure entity artifact is available for the agent to read

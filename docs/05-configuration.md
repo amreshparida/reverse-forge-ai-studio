@@ -20,8 +20,13 @@ DATABASE_URL="postgresql://user:password@localhost:5432/re_ai"
 
 ```env
 PORT=3001
+HOST=127.0.0.1
 NODE_ENV=development
+# Required before binding to a non-loopback host
+API_AUTH_TOKEN=
 ```
+
+The server binds to `127.0.0.1` by default because crawl artifacts may contain sensitive application data. Startup fails if `HOST` is changed to a non-loopback address without `API_AUTH_TOKEN`. Authenticated deployments accept either `Authorization: Bearer <token>` or `X-API-Key: <token>`. The browser client can use a token stored for the tab with `sessionStorage.setItem('reverseforge-api-token', '<token>')`.
 
 ---
 
@@ -74,6 +79,9 @@ CRAWL_MAX_CONCURRENCY=2
 # Set to false to watch the browser (debugging)
 # Default: true (headless)
 CRAWL_HEADLESS=true
+
+# Maximum human-guided session length before automatic finalization
+MANUAL_CRAWL_MAX_MINUTES=240
 ```
 
 ---

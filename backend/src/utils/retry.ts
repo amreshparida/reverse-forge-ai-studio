@@ -76,28 +76,36 @@ export function isTransientLlmError(err: unknown): boolean {
   );
 }
 
+export interface PersistentRetryOptions {
+  label?: string;
+  delayMs?: number;
+  maxDelayMs?: number;
+  backoffFactor?: number;
+  /** Maximum calls, including the first attempt. */
+  maxAttempts?: number;
+  /** Maximum wall-clock time spent retrying. */
+  maxElapsedMs?: number;
+  shouldRetry?: (error: unknown) => boolean;
+}
+
 /**
- * Keep calling until success. Backs off on every failure (never gives up).
- * Use for synthesis / expert stages where the user wants the job to finish eventually.
+ * Retry a long-running operation with bounded exponential backoff.
+ * Defaults are deliberately generous, but every job eventually terminates.
  */
 export async function retryUntilSuccess<T>(
   fn: () => Promise<T>,
-  options: {
-    label?: string;
-    delayMs?: number;
-    maxDelayMs?: number;
-    backoffFactor?: number;
-    /** If false, still retries but logs as non-transient. Default: retry everything. */
-    shouldRetry?: (error: unknown) => boolean;
-  } = {},
+  options: PersistentRetryOptions = {},
 ): Promise<T> {
   let attempt = 0;
+  const startedAt = Date.now();
   let delay = Math.max(1_000, options.delayMs ?? 8_000);
   const maxDelay = Math.max(delay, options.maxDelayMs ?? 180_000);
   const factor = options.backoffFactor ?? 1.6;
+  const maxAttempts = Math.max(1, options.maxAttempts ?? 12);
+  const maxElapsedMs = Math.max(1_000, options.maxElapsedMs ?? 30 * 60_000);
   const shouldRetry = options.shouldRetry ?? (() => true);
 
-  while (true) {
+  while (attempt < maxAttempts) {
     attempt += 1;
     try {
       return await fn();
@@ -105,9 +113,16 @@ export async function retryUntilSuccess<T>(
       if (!shouldRetry(err)) {
         throw err;
       }
+      const elapsedMs = Date.now() - startedAt;
+      if (attempt >= maxAttempts || elapsedMs >= maxElapsedMs) {
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Retry budget exhausted for "${options.label ?? 'operation'}" after ${attempt} attempt(s) and ${elapsedMs}ms: ${reason}`,
+        );
+      }
       const wait = Math.min(delay, maxDelay);
       logger.warn(
-        `Persistent retry #${attempt} for "${options.label ?? 'operation'}" in ${wait}ms` +
+        `Retry ${attempt}/${maxAttempts} for "${options.label ?? 'operation'}" in ${wait}ms` +
           (isTransientLlmError(err) ? ' (transient)' : ''),
         { error: err instanceof Error ? err.message : String(err) },
       );
@@ -115,4 +130,6 @@ export async function retryUntilSuccess<T>(
       delay = Math.min(Math.round(delay * factor), maxDelay);
     }
   }
+
+  throw new Error(`Retry budget exhausted for "${options.label ?? 'operation'}"`);
 }

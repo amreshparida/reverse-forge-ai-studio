@@ -24,6 +24,8 @@ backend/project-output/
         │   ├── graphql-schema.json                   # GraphQL schema (if found)
         │   ├── source-maps.json                      # Source map URLs detected
         │   └── cookies.json                          # Cookie structure (masked)
+        ├── har/
+        │   └── 00-https-crm.acme.com-orders.har      # Per-page HAR 1.2 (full resource waterfall)
         ├── analysis/
         │   ├── entities.json                         # Inferred entity models
         │   ├── workflows.json                        # Inferred state machines
@@ -31,9 +33,20 @@ backend/project-output/
         │   ├── architecture.json                     # System architecture
         │   └── knowledge-graph.json                  # Cross-entity knowledge graph
         └── reports/
-            ├── report.md                             # Full Markdown report
-            ├── report.pdf                            # PDF export
-            └── report-run-manifest.json              # Inventory of produced artifacts
+            ├── har-intelligence.json               # Deterministic HAR briefing
+            ├── deep-research.json                  # LLM research dossier
+            ├── final-report.md                       # Full Markdown report
+            ├── final-report.pdf                      # PDF export
+            ├── report-run-manifest.json              # Inventory of produced artifacts
+            ├── redevelopment-blueprint.json          # Target modules, phases, unknowns
+            ├── api-contract-catalog.json             # Observed, templated API contracts
+            ├── implementation-backlog.json           # Evidence-derived implementation epics
+            ├── traceability-matrix.csv                # Requirement-to-evidence mapping
+            ├── validation-plan.json                   # Contract/workflow/data/NFR gates
+            ├── REDEVELOPMENT-README.md                # Engineering handoff guide
+            └── _generation/workspace/
+                ├── network-calls/                    # Full API evidence for synthesis agents
+                └── har/                              # Full HAR 1.2 files (same as session har/)
 ```
 
 ---
@@ -130,9 +143,17 @@ backend/project-output/
 
 ---
 
+## Per-page HAR
+
+`har/<page>.har` — full HAR 1.2 log for that page (document, scripts, CSS, XHR/fetch, etc.). Written alongside `api/<page>-api.json` whenever `networkCaptureEnabled` is true. Analysis/report stages load these **complete** files into the synthesis workspace and expert evidence package (file-count capped; content not summarized).
+
+---
+
 ## Report (Markdown)
 
-`reports/report.md` is the primary deliverable. Sections:
+`reports/final-report.md` is the primary narrative deliverable. The six redevelopment files beside it form the machine-readable engineering handoff. Their presence and SHA-256 hashes are verified by `report-run-manifest.json`; missing required files mark the run degraded.
+
+Sections:
 
 1. **Executive Summary** — system name, detected modules, total pages, API count
 2. **Business Modules** — each module with its entity list and navigation paths

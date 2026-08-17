@@ -14,6 +14,7 @@ import {
   getHtmlDir,
   getPagesDir,
   getApiDir,
+  getHarDir,
   writeJson,
   writeText,
   urlToFilename,
@@ -87,6 +88,7 @@ export async function runAgentCrawl(options: AgentCrawlOptions): Promise<void> {
   let agentStartUrl = project.baseUrl; // updated below after login
   let logOverlay: LogOverlayHandle | null = null;
   let headed = false;
+  let networkRecorder: ReturnType<typeof createNetworkRecorder> | null = null;
 
   const steps: AgentStep[] = [];
   const visitedPageMeta: Array<{ url: string; title: string; pageType: string }> = [];
@@ -160,6 +162,7 @@ export async function runAgentCrawl(options: AgentCrawlOptions): Promise<void> {
     const htmlDir = getHtmlDir(projectSlug, session.id);
     const pagesDir = getPagesDir(projectSlug, session.id);
     const apiDir = getApiDir(projectSlug, session.id);
+    const harDir = getHarDir(projectSlug, session.id);
 
     // Start from post-login URL (if loginRequired) or baseUrl
     // For login sessions: reuse the existing post-login page; for fresh: navigate
@@ -173,8 +176,12 @@ export async function runAgentCrawl(options: AgentCrawlOptions): Promise<void> {
       emitCrawlLog(session.id, 'info', 'Live crawl log overlay attached to browser window');
     }
 
+    // Persistent recorder so page-load traffic is included in HAR / API capture
+    networkRecorder = project.networkCaptureEnabled ? createNetworkRecorder(page) : null;
+
     const alreadyOnStartUrl = page.url() === agentStartUrl || page.url().startsWith(agentStartUrl.split('?')[0] ?? '');
     if (!alreadyOnStartUrl) {
+      await networkRecorder?.reset();
       await page.goto(agentStartUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
       await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined);
     } else {
@@ -232,11 +239,7 @@ export async function runAgentCrawl(options: AgentCrawlOptions): Promise<void> {
 
       // Capture page if it's new
       if (isNewUrl) {
-        const netRecorder = project.networkCaptureEnabled
-          ? createNetworkRecorder(page)
-          : { getCalls: () => [], stop: () => undefined };
-
-        await sleep(200); // brief pause for network calls to register
+        await sleep(200); // brief pause for in-flight network calls to settle
 
         // Full-page screenshot only (no separate viewport shot)
         let screenshotPath: string | undefined;
@@ -281,11 +284,13 @@ export async function runAgentCrawl(options: AgentCrawlOptions): Promise<void> {
           },
         });
 
-        // Save network calls
-        if (project.networkCaptureEnabled) {
-          const calls = netRecorder.getCalls();
+        // Save network calls + HAR (same recorder window as page activity)
+        if (project.networkCaptureEnabled && networkRecorder) {
+          await networkRecorder.flush();
+          const calls = networkRecorder.getCalls();
+          writeJson(path.join(apiDir, urlToFilename(currentUrl, '-api.json')), calls);
+          writeJson(path.join(harDir, urlToFilename(currentUrl, '.har')), networkRecorder.getHar(currentUrl));
           if (calls.length > 0) {
-            writeJson(path.join(apiDir, urlToFilename(currentUrl, '-api.json')), calls);
             await prisma.networkCall.createMany({
               data: calls.map((c) => ({
                 crawlSessionId: session.id,
@@ -308,7 +313,7 @@ export async function runAgentCrawl(options: AgentCrawlOptions): Promise<void> {
               })),
             });
           }
-          netRecorder.stop();
+          await networkRecorder.reset();
         }
 
         visitedPageMeta.push({ url: currentUrl, title: pageState.title, pageType: pageState.pageType });
@@ -497,6 +502,7 @@ export async function runAgentCrawl(options: AgentCrawlOptions): Promise<void> {
     }).catch(() => undefined);
     throw err;
   } finally {
+    await networkRecorder?.stop();
     logOverlay?.dispose();
     if (!existingContext || abortSignal?.aborted) {
       await context?.close().catch(() => undefined);
@@ -510,4 +516,3 @@ function getAnalysisOutputDir(projectSlug: string, sessionId: string): string {
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
-

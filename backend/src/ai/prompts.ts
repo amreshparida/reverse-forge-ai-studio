@@ -242,12 +242,16 @@ export function buildArchitectureInferencePrompt(
   networkCalls: unknown[],
   appName?: string,
   jsIntelSamples?: unknown[],
+  harFiles?: unknown[],
 ): string {
   const context = appName ? `Application: "${appName}". ` : '';
   const jsSection = jsIntelSamples && jsIntelSamples.length > 0
     ? `\nJS Intelligence: ${JSON.stringify(jsIntelSamples, null, 2)}`
     : '';
-  return `${context}Based on page analyses, API calls, and JS intelligence, infer the technical architecture.
+  const harSection = harFiles && harFiles.length > 0
+    ? `\nFull HAR 1.2 captures: ${JSON.stringify(harFiles, null, 2)}`
+    : '';
+  return `${context}Based on page analyses, API calls, full HAR captures, and JS intelligence, infer the technical architecture.
 
 Return a JSON object:
 {
@@ -271,7 +275,7 @@ Return a JSON object:
 }
 
 Network calls: ${JSON.stringify(networkCalls, null, 2)}
-Page analyses: ${JSON.stringify(pageAnalyses, null, 2)}${jsSection}
+Page analyses: ${JSON.stringify(pageAnalyses, null, 2)}${jsSection}${harSection}
 
 Return only valid JSON.`;
 }
@@ -281,9 +285,13 @@ export function buildKnowledgeGraphPrompt(
   entities: unknown[],
   networkCalls: unknown[],
   appName?: string,
+  harFiles?: unknown[],
 ): string {
   const context = appName ? `Application: "${appName}". ` : '';
-  return `${context}Build a knowledge graph from this application's pages, entities, and API calls.
+  const harSection = harFiles && harFiles.length > 0
+    ? `\nFull HAR 1.2 captures: ${JSON.stringify(harFiles, null, 2)}`
+    : '';
+  return `${context}Build a knowledge graph from this application's pages, entities, API calls, and full HAR captures.
 
 Return a JSON knowledge graph:
 {
@@ -307,7 +315,7 @@ Return a JSON knowledge graph:
 
 Pages: ${JSON.stringify(pages, null, 2)}
 Entities: ${JSON.stringify(entities, null, 2)}
-APIs: ${JSON.stringify(networkCalls, null, 2)}
+APIs: ${JSON.stringify(networkCalls, null, 2)}${harSection}
 
 Return only valid JSON.`;
 }
@@ -323,7 +331,7 @@ Act as a combined chief software engineer, solution architect, data engineer, se
 
 Use industry-standard analysis practices:
 - Separate observed facts from reasoned inferences.
-- Trace conclusions to pages, APIs, forms, tables, workflows, and captured evidence.
+- Trace conclusions to pages, APIs, full HAR captures, HAR intelligence briefing, deep-research dossier, forms, tables, workflows, and captured evidence.
 - Identify domain model, business capabilities, data flows, integration patterns, risks, gaps, and modernization considerations.
 - Look across frontend, backend/API, data, security, product workflows, UX, operations, and migration planning.
 - Do not invent unsupported details. If evidence is incomplete, state the limitation and what should be validated.

@@ -15,6 +15,8 @@ const ALLOWED_ARTIFACTS = new Set([
   'permission-matrix.json',
   'architecture.json',
   'knowledge-graph.json',
+  'har-intelligence.json',
+  'deep-research.json',
 ]);
 
 export type SynthesisTask =
@@ -23,6 +25,7 @@ export type SynthesisTask =
   | 'permission'
   | 'architecture'
   | 'knowledge-graph'
+  | 'deep-research'
   | 'specialist';
 
 export interface SynthesisAgentResult<T> {
@@ -35,12 +38,14 @@ export interface SynthesisAgentResult<T> {
 interface CoverageState {
   pagesRead: string[];
   apisRead: string[];
+  harsRead: string[];
   graphChunksRead: string[];
 }
 
 export interface CoverageSnapshot {
   pages: { total: number; read: number; unread: number };
   apis: { total: number; read: number; unread: number };
+  hars: { total: number; read: number; unread: number };
   graphChunks: { total: number; read: number; unread: number };
   complete: boolean;
 }
@@ -48,6 +53,7 @@ export interface CoverageSnapshot {
 export interface CoverageRequirements {
   requireAllPages?: boolean;
   requireAllApis?: boolean;
+  requireAllHars?: boolean;
   requireAllGraphChunks?: boolean;
 }
 
@@ -92,6 +98,7 @@ function defaultReuseSharedEvidence(task: SynthesisTask): boolean {
     task === 'permission' ||
     task === 'architecture' ||
     task === 'knowledge-graph' ||
+    task === 'deep-research' ||
     task === 'specialist'
   );
 }
@@ -117,14 +124,20 @@ function estimateRemainingSteps(
   let reads = 0;
   if (req.requireAllPages) reads += Math.ceil(snap.pages.unread / 16);
   if (req.requireAllApis) reads += Math.ceil(snap.apis.unread / 25);
+  if (req.requireAllHars) reads += Math.ceil(snap.hars.unread / 5);
   if (req.requireAllGraphChunks) reads += Math.ceil(snap.graphChunks.unread / 10);
   return reads + (snap.complete ? 20 : 15);
 }
 
 function loadCoverage(workspace: SynthesisWorkspace): CoverageState {
   const abs = resolveWorkspacePath(workspace.root, 'coverage-state.json');
-  const existing = readJson<CoverageState>(abs);
-  return existing ?? { pagesRead: [], apisRead: [], graphChunksRead: [] };
+  const existing = readJson<Partial<CoverageState>>(abs);
+  return {
+    pagesRead: existing?.pagesRead ?? [],
+    apisRead: existing?.apisRead ?? [],
+    harsRead: existing?.harsRead ?? [],
+    graphChunksRead: existing?.graphChunksRead ?? [],
+  };
 }
 
 function saveCoverage(workspace: SynthesisWorkspace, state: CoverageState): void {
@@ -146,6 +159,11 @@ function snapshotCoverage(
     read: state.apisRead.length,
     unread: Math.max(0, workspace.networkIndex.length - state.apisRead.length),
   };
+  const hars = {
+    total: workspace.harIndex.length,
+    read: state.harsRead.length,
+    unread: Math.max(0, workspace.harIndex.length - state.harsRead.length),
+  };
   const graphChunks = {
     total: workspace.graphChunkIndex.length,
     read: state.graphChunksRead.length,
@@ -155,19 +173,22 @@ function snapshotCoverage(
   const complete =
     (!req.requireAllPages || pages.unread === 0) &&
     (!req.requireAllApis || apis.unread === 0) &&
+    (!req.requireAllHars || hars.unread === 0) &&
     (!req.requireAllGraphChunks || graphChunks.unread === 0);
 
-  return { pages, apis, graphChunks, complete };
+  return { pages, apis, hars, graphChunks, complete };
 }
 
 function defaultRequirements(task: SynthesisTask): CoverageRequirements {
   switch (task) {
     case 'architecture':
-      return { requireAllPages: true, requireAllApis: true };
+      return { requireAllPages: true, requireAllApis: true, requireAllHars: true };
+    case 'deep-research':
+      return { requireAllPages: false, requireAllApis: true, requireAllHars: true };
     case 'knowledge-graph':
       // Structural scaffold already indexes every page/API from the workspace catalogs.
-      // Only need shared page coverage (notes); do not re-drain all APIs.
-      return { requireAllPages: true, requireAllApis: false };
+      // Only need shared page coverage (notes); do not re-drain all APIs/HARs.
+      return { requireAllPages: true, requireAllApis: false, requireAllHars: false };
     case 'specialist':
       return { requireAllGraphChunks: true };
     case 'entity':
@@ -184,7 +205,7 @@ function buildTools(allowedArtifacts: string[]): ChatCompletionTool[] {
       type: 'function',
       function: {
         name: 'get_coverage',
-        description: 'Show how many pages/APIs/graph-chunks are still unread. Must reach complete=true before write_artifact.',
+        description: 'Show how many pages/APIs/HARs/graph-chunks are still unread. Must reach complete=true before write_artifact.',
         parameters: { type: 'object', properties: {}, additionalProperties: false },
       },
     },
@@ -201,6 +222,14 @@ function buildTools(allowedArtifacts: string[]): ChatCompletionTool[] {
       function: {
         name: 'list_network_calls',
         description: 'Catalog of all network/API captures.',
+        parameters: { type: 'object', properties: {}, additionalProperties: false },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'list_har_files',
+        description: 'Catalog of all full per-page HAR 1.2 captures.',
         parameters: { type: 'object', properties: {}, additionalProperties: false },
       },
     },
@@ -239,6 +268,18 @@ function buildTools(allowedArtifacts: string[]): ChatCompletionTool[] {
     {
       type: 'function',
       function: {
+        name: 'read_next_unread_hars',
+        description: 'Read the next batch of UNREAD full HAR files and mark them read. Use until hars.unread=0.',
+        parameters: {
+          type: 'object',
+          properties: { limit: { type: 'number', description: 'Batch size (default 5, max 10)' } },
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
         name: 'read_next_unread_graph_chunks',
         description: 'Read the next UNREAD graph chunk(s) and mark them read. Use until graphChunks.unread=0.',
         parameters: {
@@ -253,7 +294,7 @@ function buildTools(allowedArtifacts: string[]): ChatCompletionTool[] {
       function: {
         name: 'read_page_analysis',
         description:
-          'Re-read ONE page by id. Do NOT use when pages.unread=0 — prefer read_next_unread_pages/apis/graph_chunks for coverage.',
+          'Re-read ONE page by id. Do NOT use when pages.unread=0 — prefer read_next_unread_pages/apis/hars/graph_chunks for coverage.',
         parameters: {
           type: 'object',
           properties: { id: { type: 'string' } },
@@ -357,10 +398,40 @@ function taskBrief(
   if (task === 'architecture') {
     return `${app}${sharedHint}
 ${noteDuty}
-Infer technical architecture from page evidence (notes and/or unread pages) and every network call.
-CRITICAL: When pages.unread=0 and apis.unread>0, call ONLY read_next_unread_apis (limit=25). Never call read_page_analysis in that state.
+Infer technical architecture from page evidence (notes and/or unread pages), every network call, and every full HAR file.
+CRITICAL: When pages.unread=0 and (apis.unread>0 or hars.unread>0), call ONLY read_next_unread_apis / read_next_unread_hars. Never call read_page_analysis in that state.
+HAR files are complete HAR 1.2 captures (all entries: document/script/css/xhr/fetch/etc.) — same as session har/*.har.
 Write "${expectedArtifact}" with:
 frontendFramework, frontendLibraries, cssFramework, backendPattern, apiBaseUrl, apiVersion, authMechanism, dataFormats, paginationStyle, realtime, fileUpload, multiTenant, i18n, estimatedScale, unusualPatterns, securityObservations, migrationChallenges.`;
+  }
+  if (task === 'deep-research') {
+    return `${app}${sharedHint}
+You are a principal reverse-engineering researcher producing a Deep Research dossier (McKinsey/STRIDE-grade, evidence-linked).
+Start with read_artifact("har-intelligence.json") — those are DETERMINISTIC OBSERVED FACTS from full HAR files. Do not invent hosts or endpoints that are not in HAR/API evidence.
+Then drain unread APIs and HAR files (read_next_unread_apis / read_next_unread_hars) until get_coverage.complete=true.
+Write "${expectedArtifact}" with this EXACT shape:
+{
+  "researchThesis": "one paragraph: what the system is and how it is wired",
+  "confidence": 0.0,
+  "observedFacts": ["fact with host/endpoint/status"],
+  "inferences": [{ "claim": "...", "evidence": ["HAR/API/page"], "confidence": 0.0 }],
+  "integrationMap": {
+    "firstPartyApiFamilies": [{ "family": "...", "baseUrlHint": "...", "methods": ["GET"], "purpose": "...", "evidence": ["..."] }],
+    "thirdParties": [{ "host": "...", "category": "cdn|analytics|auth|payments|error-tracking|other", "purpose": "...", "risk": "..." }]
+  },
+  "authAndSessionModel": { "mechanism": "...", "evidence": ["..."], "risks": ["..."] },
+  "contractCatalog": [{ "method": "GET", "endpoint": "/api/...", "purpose": "...", "requestShape": ["field"], "responseShape": ["field"], "usedOnPages": ["url"] }],
+  "pageLoadStories": [{ "pageUrl": "...", "story": "what fires on load and why", "dependentApis": ["GET /..."] }],
+  "riskRegister": [{ "severity": "critical|high|medium|low", "title": "...", "detail": "...", "evidence": ["..."], "recommendation": "..." }],
+  "reconstructionPlaybook": {
+    "recommendedApproach": "strangler|modular-rewrite|api-clone-first|unknown",
+    "modulesToRebuildFirst": ["..."],
+    "dataContractsToClone": ["..."],
+    "unknownsToValidate": ["..."]
+  },
+  "openQuestions": ["what crawl/HAR still cannot prove"]
+}
+Separate facts from inferences. Cite HAR page URLs, templated endpoints, status codes, and hosts. Empty arrays are allowed; invented APIs are not.`;
   }
   if (task === 'knowledge-graph') {
     return `${app}${sharedHint}
@@ -494,15 +565,18 @@ function runTool(
 
   const pagesRead = new Set(coverage.pagesRead);
   const apisRead = new Set(coverage.apisRead);
+  const harsRead = new Set(coverage.harsRead);
   const graphRead = new Set(coverage.graphChunksRead);
 
   const markPages = (ids: string[]) => ids.forEach((id) => pagesRead.add(id));
   const markApis = (ids: string[]) => ids.forEach((id) => apisRead.add(id));
+  const markHars = (ids: string[]) => ids.forEach((id) => harsRead.add(id));
   const markGraph = (ids: string[]) => ids.forEach((id) => graphRead.add(id));
 
   const nextCoverage = (): CoverageState => ({
     pagesRead: [...pagesRead],
     apisRead: [...apisRead],
+    harsRead: [...harsRead],
     graphChunksRead: [...graphRead],
   });
 
@@ -522,6 +596,13 @@ function runTool(
     if (name === 'list_network_calls') {
       return {
         result: JSON.stringify({ count: workspace.networkIndex.length, calls: workspace.networkIndex }, null, 2),
+        coverage,
+      };
+    }
+
+    if (name === 'list_har_files' || name === 'list_har_summaries') {
+      return {
+        result: JSON.stringify({ count: workspace.harIndex.length, hars: workspace.harIndex }, null, 2),
         coverage,
       };
     }
@@ -580,6 +661,33 @@ function runTool(
       };
     }
 
+    if (name === 'read_next_unread_hars') {
+      const limit = Math.min(10, Math.max(1, Number(args['limit'] ?? 5) || 5));
+      const unread = workspace.harIndex.filter((p) => !harsRead.has(p.id)).slice(0, limit);
+      const items: unknown[] = [];
+      const errors: string[] = [];
+      for (const entry of unread) {
+        try {
+          const abs = resolveWorkspacePath(workspace.root, path.join('har', entry.file));
+          items.push(JSON.parse(fs.readFileSync(abs, 'utf-8')));
+          markHars([entry.id]);
+        } catch (err) {
+          markHars([entry.id]);
+          errors.push(`${entry.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      const cov = nextCoverage();
+      return {
+        result: JSON.stringify({
+          returned: items.length,
+          skippedErrors: errors.length ? errors : undefined,
+          coverage: snapshotCoverage(workspace, cov, req),
+          items,
+        }),
+        coverage: cov,
+      };
+    }
+
     if (name === 'read_next_unread_graph_chunks') {
       const limit = Math.min(20, Math.max(1, Number(args['limit'] ?? 10) || 10));
       const unread = workspace.graphChunkIndex.filter((p) => !graphRead.has(p.id)).slice(0, limit);
@@ -601,13 +709,23 @@ function runTool(
 
     if (name === 'read_page_analysis') {
       const snap = snapshotCoverage(workspace, nextCoverage(), req);
-      // Stop the architecture/KG death spiral: re-reading pages while APIs remain unread
+      // Stop the architecture/KG death spiral: re-reading pages while APIs/HARs remain unread
       if (snap.pages.unread === 0 && req.requireAllApis && snap.apis.unread > 0) {
         return {
           result: JSON.stringify({
             error: 'pages already fully covered — refuse read_page_analysis',
             coverage: snap,
             hint: `Call read_next_unread_apis with limit=25 (${snap.apis.unread} APIs still unread)`,
+          }),
+          coverage,
+        };
+      }
+      if (snap.pages.unread === 0 && req.requireAllHars && snap.hars.unread > 0) {
+        return {
+          result: JSON.stringify({
+            error: 'pages already fully covered — refuse read_page_analysis',
+            coverage: snap,
+            hint: `Call read_next_unread_hars with limit=5 (${snap.hars.unread} HAR files still unread)`,
           }),
           coverage,
         };
@@ -767,6 +885,8 @@ function compactMessages(
   const drainHint =
     coverageSnap.pages.unread === 0 && coverageSnap.apis.unread > 0
       ? `Pages are done. Call read_next_unread_apis (limit=25) — ${coverageSnap.apis.unread} APIs unread. Do NOT call read_page_analysis.`
+      : coverageSnap.pages.unread === 0 && coverageSnap.hars.unread > 0
+        ? `Pages are done. Call read_next_unread_hars (limit=5) — ${coverageSnap.hars.unread} HAR files unread. Do NOT call read_page_analysis.`
       : coverageSnap.complete
         ? `Coverage is complete. Call write_artifact "${expectedArtifact}" now with the FULL valid JSON object (do not omit required arrays/fields).`
         : `Continue read_next_unread_* until get_coverage.complete=true, append_working_notes, then write_artifact "${expectedArtifact}".`;
@@ -1041,6 +1161,14 @@ function validateArtifactContent(name: string, content: unknown): string | null 
     if (!Array.isArray(obj['findings'])) {
       return `${name} requires findings[]`;
     }
+    for (const finding of obj['findings'] as Array<Record<string, unknown>>) {
+      if (typeof finding['title'] !== 'string' || typeof finding['detail'] !== 'string') {
+        return `${name} findings require string title and detail fields`;
+      }
+      if (!Array.isArray(finding['evidenceNodeIds']) || finding['evidenceNodeIds'].length === 0) {
+        return `${name} finding "${String(finding['title'] ?? '?')}" requires at least one evidenceNodeId`;
+      }
+    }
   }
 
   return null;
@@ -1089,7 +1217,7 @@ export async function runSynthesisAgent<T>(args: {
 
   if (args.task === 'entity' || (!wantReuse && args.task !== 'specialist')) {
     // Fresh page drain — seeds shared notes for later stages
-    coverage = { pagesRead: [], apisRead: [], graphChunksRead: [] };
+    coverage = { pagesRead: [], apisRead: [], harsRead: [], graphChunksRead: [] };
     writeJson(resolveWorkspacePath(args.workspace.root, 'working-notes.json'), { notes: [] });
   } else if (args.task === 'specialist') {
     if (sharedGraphReady) {
@@ -1104,10 +1232,11 @@ export async function runSynthesisAgent<T>(args: {
       coverage = {
         pagesRead: coverage.pagesRead,
         apisRead: coverage.apisRead,
+        harsRead: coverage.harsRead,
         graphChunksRead: [],
       };
-      // Keep existing working notes if any; only clear when starting a brand-new graph drain with no notes
-      if (loadWorkingNotes(args.workspace).notes.length === 0) {
+      // Independent specialists must not inherit another specialist's interpretation.
+      if (!wantReuse || loadWorkingNotes(args.workspace).notes.length === 0) {
         writeJson(resolveWorkspacePath(args.workspace.root, 'working-notes.json'), { notes: [] });
       }
     }
@@ -1116,6 +1245,7 @@ export async function runSynthesisAgent<T>(args: {
     coverage = {
       pagesRead: coverage.pagesRead,
       apisRead: req.requireAllApis ? [] : coverage.apisRead,
+      harsRead: req.requireAllHars ? [] : coverage.harsRead,
       graphChunksRead: req.requireAllGraphChunks ? [] : coverage.graphChunksRead,
     };
     logger.info(
@@ -1126,6 +1256,7 @@ export async function runSynthesisAgent<T>(args: {
     coverage = {
       pagesRead: coverage.pagesRead,
       apisRead: req.requireAllApis ? [] : coverage.apisRead,
+      harsRead: req.requireAllHars ? [] : coverage.harsRead,
       graphChunksRead: req.requireAllGraphChunks ? [] : coverage.graphChunksRead,
     };
     logger.info(
@@ -1175,7 +1306,7 @@ export async function runSynthesisAgent<T>(args: {
           sharedGraphReady,
         ),
         '',
-        `Evidence counts: pages=${args.workspace.index.length}, apis=${args.workspace.networkIndex.length}, graphChunks=${args.workspace.graphChunkIndex.length}`,
+        `Evidence counts: pages=${args.workspace.index.length}, apis=${args.workspace.networkIndex.length}, hars=${args.workspace.harIndex.length}, graphChunks=${args.workspace.graphChunkIndex.length}`,
         sharedReady
           ? 'Start with get_coverage + read_working_notes (+ read_artifact for prior models), then write_artifact.'
           : 'Start with get_coverage, then read_next_unread_* loops, append_working_notes, then write_artifact.',
@@ -1209,13 +1340,19 @@ export async function runSynthesisAgent<T>(args: {
           coverage: snapExtend,
         };
       }
+      if (step > hardCeiling) {
+        throw new Error(
+          `[SynthesisAgent] ${args.task} exceeded the hard step ceiling (${hardCeiling}); ` +
+            `unread pages=${snapExtend.pages.unread}, apis=${snapExtend.apis.unread}, ` +
+            `hars=${snapExtend.hars.unread}, graph=${snapExtend.graphChunks.unread}`,
+        );
+      }
       const need = estimateRemainingSteps(args.workspace, coverage, req);
       const extension = Math.max(config.llm.synthesisMaxSteps, need, 60);
-      // Never give up: keep extending past the soft ceiling
-      const nextBudget = stepBudget + extension;
+      const nextBudget = Math.min(hardCeiling, stepBudget + extension);
       logger.info(
         `[SynthesisAgent] ${args.task}: extending step budget ${stepBudget} → ${nextBudget} ` +
-          `(softCeiling was ${hardCeiling}; unread pages=${snapExtend.pages.unread} apis=${snapExtend.apis.unread} graph=${snapExtend.graphChunks.unread})`,
+          `(hardCeiling=${hardCeiling}; unread pages=${snapExtend.pages.unread} apis=${snapExtend.apis.unread} hars=${snapExtend.hars.unread} graph=${snapExtend.graphChunks.unread})`,
       );
       stepBudget = nextBudget;
     }
@@ -1226,6 +1363,8 @@ export async function runSynthesisAgent<T>(args: {
       const drainTool =
         req.requireAllApis && snapBefore.apis.unread > 0
           ? 'read_next_unread_apis'
+          : req.requireAllHars && snapBefore.hars.unread > 0
+            ? 'read_next_unread_hars'
           : req.requireAllPages && snapBefore.pages.unread > 0
             ? 'read_next_unread_pages'
             : req.requireAllGraphChunks && snapBefore.graphChunks.unread > 0
@@ -1236,7 +1375,9 @@ export async function runSynthesisAgent<T>(args: {
         const out = runTool(
           args.workspace,
           drainTool,
-          JSON.stringify({ limit: drainTool.includes('apis') ? 25 : drainTool.includes('pages') ? 16 : 10 }),
+          JSON.stringify({
+            limit: drainTool.includes('apis') ? 25 : drainTool.includes('pages') ? 16 : 10,
+          }),
           coverage,
           req,
           allowed,
@@ -1379,6 +1520,11 @@ export async function runSynthesisAgent<T>(args: {
       messages.push({
         role: 'user',
         content: `STOP re-reading pages. pages.unread=0 but apis.unread=${snap.apis.unread}. Call read_next_unread_apis with limit=25 now, then write_artifact "${args.expectedArtifact}" when complete.`,
+      });
+    } else if (!wrote && snap.pages.unread === 0 && req.requireAllHars && snap.hars.unread > 0) {
+      messages.push({
+        role: 'user',
+        content: `STOP re-reading pages. pages.unread=0 but hars.unread=${snap.hars.unread}. Call read_next_unread_hars with limit=5 now, then write_artifact "${args.expectedArtifact}" when complete.`,
       });
     } else if (!wrote && snap.pages.unread === 0 && req.requireAllGraphChunks && snap.graphChunks.unread > 0) {
       messages.push({
