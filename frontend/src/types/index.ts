@@ -20,6 +20,8 @@ export interface CrawlSession {
   id: string;
   projectId: string;
   status: 'pending' | 'awaiting_login' | 'running' | 'completed' | 'failed' | 'stopped';
+  sourceType?: 'crawl' | 'upload';
+  uploadSummary?: string;
   startedAt?: string;
   finishedAt?: string;
   errorMessage?: string;

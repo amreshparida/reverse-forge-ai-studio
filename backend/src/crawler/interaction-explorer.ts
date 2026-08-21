@@ -85,15 +85,33 @@ export async function exploreSafeInteractions(
         const href = (node as HTMLAnchorElement).href || node.getAttribute('href') ||
           node.getAttribute('data-href') || '';
         const text = ((node.textContent || '') + ' ' + (node.getAttribute('aria-label') || '')).trim();
+        const onclick = node.getAttribute('onclick') || '';
+        if (/window\s*\.\s*close\s*\(|self\s*\.\s*close\s*\(/i.test(onclick + ' ' + href)) return true;
         const blob = [node.id, (node as HTMLElement).className, text, href].join(' ');
         return /log[_\\s-]*out|sign[_\\s-]*out|signout|wb-power|logouta/i.test(blob);
       }).catch(() => false);
       if (blocked) {
-        logger.info(`[InteractionExplorer] Skipped logout/session-end control: "${el.text}"`);
+        logger.info(`[InteractionExplorer] Skipped logout/session-end/window.close control: "${el.text}"`);
         continue;
       }
 
-      await locator.click({ timeout: 5000 });
+      // Prefer text match over generic class selectors (btn.btn-sm often hits window.close)
+      const text = (el.text || '').trim();
+      const clickTarget = text
+        ? page.locator(`${el.tag || 'button'}:visible`, { hasText: text }).first()
+        : locator;
+      if (!(await clickTarget.isVisible({ timeout: 1500 }).catch(() => false))) continue;
+      const closesWindow = await clickTarget.evaluate((node) => {
+        const onclick = node.getAttribute('onclick') || '';
+        const href = node.getAttribute('href') || '';
+        return /window\s*\.\s*close\s*\(|self\s*\.\s*close\s*\(/i.test(onclick + ' ' + href);
+      }).catch(() => false);
+      if (closesWindow) {
+        logger.info(`[InteractionExplorer] Skipped window.close control: "${el.text}"`);
+        continue;
+      }
+
+      await clickTarget.click({ timeout: 5000 });
       await page.waitForLoadState('domcontentloaded', { timeout: 6000 }).catch(() => undefined);
       await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => undefined);
       await sleep(500);

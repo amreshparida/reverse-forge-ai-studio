@@ -32,9 +32,11 @@ import {
 } from '../utils/file-system';
 import { sleep } from '../utils/retry';
 import { isUrlSafe } from './safety';
-import { getSessionPath, saveSession, sessionExists } from './session';
-import { installSessionEndGuard } from './session-end-guard';
+import { saveSession, sessionExists, getSessionPath } from './session';
+import { installSessionEndGuard, installWindowCloseGuard } from './session-end-guard';
 import { crawlAbortRegistry } from './crawl-abort';
+import { waitForPageSettled } from './new-page-follower';
+import { isManualControlPage, openManualControlWindow, type ManualControlHandle } from './manual-controls';
 
 export interface ManualCrawlProgressInfo {
   capturedCount: number;
@@ -70,85 +72,6 @@ interface ManualTraceEntry {
   screenshotPath: string | null;
 }
 
-const MANUAL_OVERLAY_ID = '__reverse-forge-manual-controls__';
-
-function manualOverlayScript(): void {
-  const bindingName = '__reverseForgeManualCommand';
-  const overlayId = '__reverse-forge-manual-controls__';
-  const globalState = window as unknown as Record<string, unknown>;
-  if (globalState['__reverseForgeManualInstalled']) return;
-  globalState['__reverseForgeManualInstalled'] = true;
-
-  const command = async (action: string) => {
-    const binding = globalState[bindingName] as ((value: string) => Promise<{ capturing: boolean; message: string }>) | undefined;
-    if (!binding) return { capturing: false, message: 'Recorder connection unavailable' };
-    return binding(action);
-  };
-
-  const install = async () => {
-    if (!document.body || document.getElementById(overlayId)) return;
-    const panel = document.createElement('div');
-    panel.id = overlayId;
-    panel.style.cssText = [
-      'position:fixed', 'right:18px', 'bottom:18px', 'z-index:2147483647',
-      'width:280px', 'padding:12px', 'border-radius:12px',
-      'background:rgba(17,24,39,.96)', 'color:#fff',
-      'box-shadow:0 8px 32px rgba(0,0,0,.4)',
-      'font:13px/1.35 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif',
-    ].join(';');
-    panel.innerHTML = `
-      <div style="font-weight:700;margin-bottom:7px">🧭 ReverseForge Manual Capture</div>
-      <div data-rf-status style="color:#cbd5e1;margin-bottom:9px">Connecting…</div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap">
-        <button data-rf-start style="display:none;background:#16a34a;color:white;border:0;border-radius:7px;padding:7px 10px;cursor:pointer">Start capture</button>
-        <button data-rf-capture style="background:#4f46e5;color:white;border:0;border-radius:7px;padding:7px 10px;cursor:pointer">Capture current state</button>
-        <button data-rf-finish style="background:#dc2626;color:white;border:0;border-radius:7px;padding:7px 10px;cursor:pointer">Finish & save</button>
-      </div>`;
-    document.body.appendChild(panel);
-
-    const status = panel.querySelector<HTMLElement>('[data-rf-status]')!;
-    const start = panel.querySelector<HTMLButtonElement>('[data-rf-start]')!;
-    const capture = panel.querySelector<HTMLButtonElement>('[data-rf-capture]')!;
-    const finish = panel.querySelector<HTMLButtonElement>('[data-rf-finish]')!;
-    let lastUrl = location.href;
-    let capturing = false;
-
-    const render = (state: { capturing: boolean; message: string }) => {
-      capturing = state.capturing;
-      status.textContent = state.message;
-      start.style.display = capturing ? 'none' : 'inline-block';
-      capture.disabled = !capturing;
-      capture.style.opacity = capturing ? '1' : '.45';
-    };
-    render(await command('status'));
-
-    start.onclick = async () => render(await command('start'));
-    capture.onclick = async () => {
-      status.textContent = 'Capturing current state…';
-      render(await command('capture'));
-    };
-    finish.onclick = async () => {
-      start.disabled = true;
-      capture.disabled = true;
-      finish.disabled = true;
-      status.textContent = 'Saving final capture…';
-      render(await command('finish'));
-    };
-
-    window.setInterval(() => {
-      if (!capturing || location.href === lastUrl) return;
-      lastUrl = location.href;
-      void command('navigated').then(render);
-    }, 600);
-  };
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => { void install(); }, { once: true });
-  } else {
-    void install();
-  }
-}
-
 export function manualCaptureFilename(sequence: number, url: string, extension: string): string {
   const prefix = `manual-${String(sequence).padStart(4, '0')}-`;
   try {
@@ -176,34 +99,57 @@ export async function runManualCrawl(options: ManualCrawlOptions): Promise<void>
   const trace: ManualTraceEntry[] = [];
   const allCalls: RecordedNetworkCall[] = [];
   let browser: Browser | null = null;
+  let controlBrowser: Browser | null = null;
   let context: BrowserContext | null = null;
-  let capturing = !project.loginRequired;
+  let controlContext: BrowserContext | null = null;
+  let controls: ManualControlHandle | null = null;
+  let capturing = false; // Always wait for green "Start capture" (login or not)
   let guardInstalled = false;
   let finishing = false;
   let captureSequence = 0;
   let captureQueue = Promise.resolve();
   let finishResolve: (() => void) | null = null;
   const finished = new Promise<void>((resolve) => { finishResolve = resolve; });
+  let endReason: 'finish' | 'browser-closed' | 'aborted' | 'timeout' | null = null;
+  let relaunchingApp = false;
+  /** Track last URL per app page for SPA hash changes */
+  const lastSeenUrl = new WeakMap<Page, string>();
 
   const progress = (status: ManualCrawlProgressInfo['status'], message: string, page?: Page) => {
     onProgress?.({ capturedCount: trace.length, currentUrl: page?.url() ?? '', status, message });
   };
 
-  const hideControls = async (page: Page) => {
-    await page.evaluate((id) => {
-      const element = document.getElementById(id);
-      if (element) element.style.display = 'none';
-    }, MANUAL_OVERLAY_ID).catch(() => undefined);
-  };
-  const showControls = async (page: Page) => {
-    await page.evaluate((id) => {
-      const element = document.getElementById(id);
-      if (element) element.style.display = 'block';
-    }, MANUAL_OVERLAY_ID).catch(() => undefined);
+  const chromeArgs = ['--start-maximized', '--disable-dev-shm-usage', '--disable-gpu'];
+
+  /** Heavy Essential Viewer reports crash Chrome on fullPage screenshots — use viewport only. */
+  const takeSafeScreenshot = async (page: Page, absPath: string): Promise<boolean> => {
+    const url = page.url();
+    const heavy =
+      /\/viewer\//i.test(url) ||
+      /[?&]XSL=/i.test(url) ||
+      /reportXML/i.test(url) ||
+      /Catalogue|Catalog/i.test(url);
+    try {
+      if (heavy) {
+        await page.screenshot({ path: absPath, fullPage: false, timeout: 8_000 });
+        return true;
+      }
+      await page.screenshot({ path: absPath, fullPage: true, timeout: 12_000 });
+      return true;
+    } catch (err) {
+      logger.warn(`[Manual] fullPage screenshot failed, trying viewport: ${err instanceof Error ? err.message : String(err)}`);
+      try {
+        await page.screenshot({ path: absPath, fullPage: false, timeout: 8_000 });
+        return true;
+      } catch (err2) {
+        logger.warn(`[Manual] Screenshot skipped: ${err2 instanceof Error ? err2.message : String(err2)}`);
+        return false;
+      }
+    }
   };
 
   const capturePage = async (page: Page, reason: string, force = false): Promise<void> => {
-    if (!capturing || page.isClosed()) return;
+    if (!capturing || page.isClosed() || isManualControlPage(page)) return;
     const state = states.get(page);
     if (!state) return;
     const url = page.url();
@@ -215,26 +161,24 @@ export async function runManualCrawl(options: ManualCrawlOptions): Promise<void>
     if (!force && state.lastCapturedUrl === url) return;
 
     await page.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => undefined);
-    await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => undefined);
-    await sleep(300);
+    await sleep(400);
     if (page.isClosed()) return;
 
     captureSequence += 1;
     const sequence = captureSequence;
     progress('capturing', `Capturing ${url}`, page);
-    await hideControls(page);
     try {
       const capturedAt = new Date().toISOString();
       const startedAt = Date.now();
-      const [title, html, visibleText] = await Promise.all([
-        page.title().catch(() => ''),
-        page.evaluate((overlayId) => {
-          const clone = document.documentElement.cloneNode(true) as HTMLElement;
-          clone.querySelector(`#${overlayId}`)?.remove();
-          return `<!DOCTYPE html>\n${clone.outerHTML}`;
-        }, MANUAL_OVERLAY_ID).catch(() => ''),
-        page.evaluate(() => document.body?.innerText?.slice(0, 20_000) ?? '').catch(() => ''),
-      ]);
+      const title = await page.title().catch(() => '');
+      // Cap HTML — huge Viewer DOMs can OOM Chrome for Testing during serialize
+      const html = await page
+        .evaluate(() => {
+          const raw = `<!DOCTYPE html>\n${document.documentElement.outerHTML}`;
+          return raw.length > 1_500_000 ? `${raw.slice(0, 1_500_000)}\n<!-- truncated -->` : raw;
+        })
+        .catch(() => '');
+      const visibleText = await page.evaluate(() => document.body?.innerText?.slice(0, 20_000) ?? '').catch(() => '');
       const extractedData = await extractPageData(page, url, [], [...state.consoleEntries]).catch(() => null);
       const screenshotName = manualCaptureFilename(sequence, url, '.png');
       const htmlName = manualCaptureFilename(sequence, url, '.html');
@@ -244,8 +188,8 @@ export async function runManualCrawl(options: ManualCrawlOptions): Promise<void>
       let screenshotPath: string | null = null;
       if (project.screenshotEnabled) {
         const screenshotAbs = path.join(screenshotsDir, screenshotName);
-        await page.screenshot({ path: screenshotAbs, fullPage: true, timeout: 20_000 }).catch(() => undefined);
-        screenshotPath = path.relative(outputRoot, screenshotAbs).replace(/\\/g, '/');
+        const ok = await takeSafeScreenshot(page, screenshotAbs);
+        if (ok) screenshotPath = path.relative(outputRoot, screenshotAbs).replace(/\\/g, '/');
       }
       writeText(path.join(htmlDir, htmlName), html);
       if (extractedData) writeJson(path.join(pagesDir, pageName), extractedData);
@@ -312,8 +256,10 @@ export async function runManualCrawl(options: ManualCrawlOptions): Promise<void>
       writeJson(path.join(pagesDir, '_manual-trace.json'), trace);
       await prisma.crawlSession.update({ where: { id: session.id }, data: { pagesCount: trace.length } });
       progress('captured', `Captured ${title || url} (${calls.length} network calls)`, page);
-    } finally {
-      await showControls(page);
+      logger.info(`[Manual] ✓ #${sequence} "${title || 'untitled'}" (${calls.length} APIs) — ${url}`);
+      await controls?.setStatus(`Captured ${trace.length} page(s) · ${title || url}`, true);
+    } catch (err) {
+      logger.warn(`[Manual] Capture failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
@@ -336,7 +282,7 @@ export async function runManualCrawl(options: ManualCrawlOptions): Promise<void>
   };
 
   const attachPage = (page: Page) => {
-    if (states.has(page)) return;
+    if (isManualControlPage(page) || states.has(page)) return;
     const state: ManualPageState = {
       recorder: project.networkCaptureEnabled ? createNetworkRecorder(page) : null,
       websocketRecorder: createWebSocketRecorder(page),
@@ -345,6 +291,7 @@ export async function runManualCrawl(options: ManualCrawlOptions): Promise<void>
       captureTimer: null,
     };
     states.set(page, state);
+    lastSeenUrl.set(page, page.url());
     page.on('console', (message) => {
       const type = message.type();
       if (type === 'error' || type === 'warning') {
@@ -352,108 +299,198 @@ export async function runManualCrawl(options: ManualCrawlOptions): Promise<void>
       }
     });
     page.on('domcontentloaded', () => scheduleCapture(page, 'navigation'));
+    page.on('framenavigated', () => {
+      if (!capturing || finishing) return;
+      const url = page.url();
+      if (lastSeenUrl.get(page) === url) return;
+      lastSeenUrl.set(page, url);
+      scheduleCapture(page, 'spa-navigation');
+    });
     page.on('close', () => {
       if (state.captureTimer) clearTimeout(state.captureTimer);
     });
-    if (capturing) scheduleCapture(page, 'page-opened');
+    if (capturing) {
+      void waitForPageSettled(page).then(() => scheduleCapture(page, 'page-opened'));
+    }
   };
 
-  try {
-    browser = await chromium.launch({ headless: false, args: ['--start-maximized'] });
-    const contextOptions: Parameters<Browser['newContext']>[0] = { viewport: null };
-    if (sessionExists(projectSlug)) contextOptions.storageState = getSessionPath(projectSlug);
-    context = await browser.newContext(contextOptions);
-    crawlAbortRegistry.registerBrowser(session.id, browser);
+  const statusPayload = () => ({
+    capturing,
+    message: capturing
+      ? `Recording enabled · ${trace.length} capture(s)`
+      : 'Log in on the app window, then click Start capture here.',
+  });
 
-    await context.exposeBinding('__reverseForgeManualCommand', async ({ page }, rawAction: unknown) => {
-      const action = String(rawAction);
-      if (action === 'status') {
-        return {
-          capturing,
-          message: capturing
-            ? `Recording enabled · ${trace.length} capture(s)`
-            : 'Log in, then click Start capture',
-        };
+  const handleStart = async () => {
+    if (!capturing) {
+      capturing = true;
+      if (!guardInstalled && context) {
+        await installSessionEndGuard(context);
+        guardInstalled = true;
       }
-      if (action === 'start') {
-        if (!capturing) {
-          capturing = true;
-          if (!guardInstalled) {
-            await installSessionEndGuard(context!);
-            guardInstalled = true;
-          }
-          await saveSession(context!, projectSlug).catch(() => undefined);
-          await prisma.crawlSession.update({
-            where: { id: session.id },
-            data: { status: 'running', startedAt: new Date(), errorMessage: null },
-          });
-          // Discard login traffic and console output before recording application evidence.
-          for (const openPage of context!.pages()) {
-            const state = states.get(openPage);
-            await state?.recorder?.reset();
-            if (state) state.consoleEntries.length = 0;
-            scheduleCapture(openPage, 'capture-started');
-          }
-          progress('capturing', 'Manual capture started', page);
-        }
-      } else if (action === 'capture') {
-        await enqueueCapture(page, 'manual', true);
-      } else if (action === 'navigated') {
-        scheduleCapture(page, 'spa-navigation');
-      } else if (action === 'finish') {
-        finishing = true;
-        await enqueueCapture(page, 'finish', true);
-        finishResolve?.();
-      }
-      return { capturing, message: `Recording enabled · ${trace.length} capture(s)` };
-    });
-    await context.addInitScript(manualOverlayScript);
-    context.on('page', (page) => attachPage(page));
-    for (const existingPage of context.pages()) attachPage(existingPage);
-    const page = context.pages()[0] ?? await context.newPage();
-
-    if (capturing) {
-      await installSessionEndGuard(context);
-      guardInstalled = true;
+      if (context) await saveSession(context, projectSlug).catch(() => undefined);
       await prisma.crawlSession.update({
         where: { id: session.id },
         data: { status: 'running', startedAt: new Date(), errorMessage: null },
       });
-    } else {
-      await prisma.crawlSession.update({
-        where: { id: session.id },
-        data: { status: 'awaiting_login', errorMessage: 'Manual browser opened — log in, then click Start capture.' },
-      });
+      for (const openPage of context?.pages() ?? []) {
+        if (isManualControlPage(openPage)) continue;
+        const state = states.get(openPage);
+        await state?.recorder?.reset();
+        if (state) state.consoleEntries.length = 0;
+        scheduleCapture(openPage, 'capture-started');
+      }
+      progress('capturing', 'Manual capture started');
+      logger.info('[Manual] Capture started by user');
     }
+    return statusPayload();
+  };
 
-    const startUrl = project.loginRequired ? (project.loginUrl || project.baseUrl) : project.baseUrl;
+  const getAppPage = () =>
+    context?.pages().find((p) => !p.isClosed() && !isManualControlPage(p) && /^https?:/i.test(p.url()))
+    ?? null;
+
+  const relaunchAppBrowser = async (resumeUrl?: string): Promise<void> => {
+    if (relaunchingApp || finishing || endReason) return;
+    relaunchingApp = true;
+    try {
+      logger.warn('[Manual] App Chrome crashed — relaunching with saved session…');
+      await controls?.setStatus('App Chrome crashed on a heavy page. Relaunching…', capturing);
+      await context?.close().catch(() => undefined);
+      await browser?.close().catch(() => undefined);
+
+      browser = await chromium.launch({ headless: false, args: chromeArgs });
+      crawlAbortRegistry.registerBrowser(session.id, browser);
+      const ctxOpts: Parameters<Browser['newContext']>[0] = { viewport: null };
+      if (sessionExists(projectSlug)) ctxOpts.storageState = getSessionPath(projectSlug);
+      context = await browser.newContext(ctxOpts);
+      await installWindowCloseGuard(context);
+      if (capturing) {
+        await installSessionEndGuard(context);
+        guardInstalled = true;
+      }
+      context.on('page', (page) => attachPage(page));
+      wireAppDisconnect(browser);
+
+      const page = await context.newPage();
+      attachPage(page);
+      const target =
+        resumeUrl ||
+        trace[trace.length - 1]?.url ||
+        project.loginUrl ||
+        project.baseUrl;
+      await page.goto(target, { waitUntil: 'domcontentloaded', timeout: config.crawler.timeoutMs }).catch(() => undefined);
+      await controls?.setStatus(
+        `App relaunched at last page. Continue exploring, then Finish & save. (${trace.length} captures kept)`,
+        capturing,
+      );
+      logger.info(`[Manual] App relaunched → ${page.url()}`);
+    } catch (err) {
+      logger.error(`[Manual] App relaunch failed: ${err instanceof Error ? err.message : String(err)}`);
+      await controls?.setStatus('App relaunch failed — click Finish & save to keep captures so far.', capturing);
+    } finally {
+      relaunchingApp = false;
+    }
+  };
+
+  const wireAppDisconnect = (appBrowser: Browser) => {
+    appBrowser.once('disconnected', () => {
+      if (finishing || endReason === 'finish' || endReason === 'aborted') return;
+      logger.warn('[Manual] App browser disconnected (crash or quit)');
+      void relaunchAppBrowser();
+    });
+  };
+
+  const handleCapture = async () => {
+    const appPage = getAppPage();
+    if (appPage) await enqueueCapture(appPage, 'manual', true);
+    else await controls?.setStatus('No app page open — wait for relaunch or open the app window.', capturing);
+    return statusPayload();
+  };
+
+  const handleFinish = async () => {
+    finishing = true;
+    endReason = 'finish';
+    const appPage = getAppPage();
+    if (appPage) await enqueueCapture(appPage, 'finish', true);
+    logger.info(`[Manual] Finish & save clicked — ${trace.length} capture(s)`);
+    finishResolve?.();
+    return { capturing: true, message: `Saved ${trace.length} capture(s). Closing…` };
+  };
+
+  try {
+    // Separate Chromium for controls — survives Application Catalogue / Viewer crashes
+    controlBrowser = await chromium.launch({ headless: false, args: chromeArgs });
+    controlContext = await controlBrowser.newContext({ viewport: { width: 400, height: 480 } });
+    crawlAbortRegistry.registerBrowser(session.id, controlBrowser);
+
+    controls = await openManualControlWindow(controlContext, {
+      onStart: handleStart,
+      onCapture: handleCapture,
+      onFinish: handleFinish,
+      getStatus: statusPayload,
+    });
+
+    browser = await chromium.launch({ headless: false, args: chromeArgs });
+    context = await browser.newContext({ viewport: null });
+    crawlAbortRegistry.registerBrowser(session.id, browser);
+    await installWindowCloseGuard(context);
+    context.on('page', (page) => attachPage(page));
+    wireAppDisconnect(browser);
+
+    const page = await context.newPage();
+    attachPage(page);
+
+    await prisma.crawlSession.update({
+      where: { id: session.id },
+      data: { status: 'awaiting_login', errorMessage: 'Manual browser opened — log in, then click Start capture in the control window.' },
+    });
+
+    const startUrl = project.loginUrl || project.baseUrl;
     await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: config.crawler.timeoutMs }).catch(() => undefined);
-    if (capturing) scheduleCapture(page, 'initial-page');
-    progress(capturing ? 'capturing' : 'waiting', capturing
-      ? 'Explore normally; pages are captured automatically. Use Capture current state for tabs or modals.'
-      : 'Log in, then click Start capture in the browser.', page);
 
-    const disconnected = new Promise<void>((resolve) => browser!.once('disconnected', () => resolve()));
+    await controls.setStatus('Log in on the APP Chrome window, then click ✓ Start capture here.', false);
+    await controls.page.bringToFront().catch(() => undefined);
+    progress('waiting', 'Two Chrome windows: Controls (this) + App. Start capture after login.', page);
+    logger.info('[Manual] Dual Chrome: controls + app (app crashes will auto-relaunch)');
+
+    const controlGone = new Promise<void>((resolve) => {
+      controlBrowser!.once('disconnected', () => {
+        if (!endReason) endReason = 'browser-closed';
+        resolve();
+      });
+    });
     const aborted = new Promise<void>((resolve) => {
-      if (abortSignal?.aborted) return resolve();
-      abortSignal?.addEventListener('abort', () => resolve(), { once: true });
+      if (abortSignal?.aborted) {
+        endReason = 'aborted';
+        return resolve();
+      }
+      abortSignal?.addEventListener('abort', () => {
+        endReason = 'aborted';
+        resolve();
+      }, { once: true });
     });
     const maxDurationMs = config.crawler.manualMaxDurationMs;
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
     const timedOut = new Promise<void>((resolve) => {
-      timeoutHandle = setTimeout(resolve, maxDurationMs);
+      timeoutHandle = setTimeout(() => {
+        if (!endReason) endReason = 'timeout';
+        resolve();
+      }, maxDurationMs);
     });
-    await Promise.race([finished, disconnected, aborted, timedOut]);
+    // Do NOT end on app browser crash — relaunchAppBrowser handles that
+    await Promise.race([finished, controlGone, aborted, timedOut]);
     if (timeoutHandle) clearTimeout(timeoutHandle);
     finishing = true;
+    logger.info(`[Manual] Session ending (${endReason ?? 'unknown'}) — ${trace.length} capture(s)`);
     for (const state of states.values()) {
       if (state.captureTimer) clearTimeout(state.captureTimer);
     }
     await captureQueue;
 
-    if (context && !abortSignal?.aborted && context.browser()?.isConnected()) {
+    if (context && endReason !== 'browser-closed' && endReason !== 'aborted' && context.browser()?.isConnected()) {
       await saveSession(context, projectSlug).catch(() => undefined);
-      const currentPage = context.pages().find((candidate) => !candidate.isClosed());
+      const currentPage = getAppPage();
       if (currentPage) {
         const websocketCaptures = [...states.values()].flatMap((state) => state.websocketRecorder.getCaptures());
         if (websocketCaptures.length > 0) writeJson(path.join(apiDir, '_websocket-captures.json'), websocketCaptures);
@@ -475,18 +512,33 @@ export async function runManualCrawl(options: ManualCrawlOptions): Promise<void>
       }
     }
 
-    if (!abortSignal?.aborted) {
-      const status = trace.length > 0 ? 'completed' : 'stopped';
+    if (endReason !== 'aborted') {
+      const status =
+        endReason === 'finish' && trace.length > 0
+          ? 'completed'
+          : endReason === 'browser-closed'
+            ? 'stopped'
+            : trace.length > 0
+              ? 'completed'
+              : 'stopped';
+      const errorMessage =
+        endReason === 'browser-closed'
+          ? 'Control window was closed before Finish & save — captures so far were kept'
+          : endReason === 'timeout'
+            ? 'Manual crawl reached max duration and was finalized'
+            : trace.length > 0
+              ? null
+              : 'Manual crawl ended without any captured pages';
       await prisma.crawlSession.update({
         where: { id: session.id },
         data: {
           status,
           pagesCount: trace.length,
           finishedAt: new Date(),
-          errorMessage: trace.length > 0 ? null : 'Manual crawl ended without any captured pages',
+          errorMessage,
         },
       });
-      progress('finished', `Manual crawl finished with ${trace.length} capture(s)`, page);
+      progress('finished', `Manual crawl finished (${endReason ?? 'unknown'}) with ${trace.length} capture(s)`);
     }
   } catch (err) {
     if (!abortSignal?.aborted) {
@@ -498,6 +550,7 @@ export async function runManualCrawl(options: ManualCrawlOptions): Promise<void>
     }
     throw err;
   } finally {
+    controls?.dispose();
     for (const state of states.values()) {
       if (state.captureTimer) clearTimeout(state.captureTimer);
       await state.recorder?.stop();
@@ -505,5 +558,7 @@ export async function runManualCrawl(options: ManualCrawlOptions): Promise<void>
     }
     await context?.close().catch(() => undefined);
     await browser?.close().catch(() => undefined);
+    await controlContext?.close().catch(() => undefined);
+    await controlBrowser?.close().catch(() => undefined);
   }
 }

@@ -1,4 +1,5 @@
 import { analyzeSession } from '../ai/analyzer';
+import { analyzeEvidenceImages } from '../evidence/image-analysis';
 import { inferEntities, type EntityModel } from '../inference/entity';
 import { inferWorkflows, type WorkflowModel } from '../inference/workflow';
 import { inferPermissions, type PermissionMatrix } from '../inference/permissions';
@@ -182,6 +183,15 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
           url: failure.url,
           error: failure.error,
         })));
+
+        const imageOcr = await analyzeEvidenceImages({
+          projectSlug,
+          sessionId: sourceSessionId,
+          llmConfig,
+        });
+        logger.info(
+          `[Generation] Image OCR for session ${sourceSessionId}: ${imageOcr.analyzed} analyzed, ${imageOcr.skipped} cached`,
+        );
       }
       if (failedPages.length > 0) {
         const examples = failedPages.slice(0, 3).map((failure) => failure.url).join(', ');

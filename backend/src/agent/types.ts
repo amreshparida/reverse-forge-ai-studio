@@ -74,12 +74,42 @@ export interface PageState {
   pageType: 'list' | 'form' | 'detail' | 'dashboard' | 'login' | 'settings' | 'unknown';
 }
 
+export interface InteractionRecord {
+  step: number;
+  url: string;
+  title: string;
+  pageType?: string;
+  actionType: string;
+  /** Human-readable action, e.g. click [3] "Capture" */
+  actionDetail: string;
+  reason: string;
+  resultUrl: string;
+  /** Validator / outcome notes */
+  outcome?: string;
+}
+
+export interface RollingSummary {
+  fromStep: number;
+  toStep: number;
+  summary: string;
+  openThreads?: string[];
+  avoidRepeating?: string[];
+  nextFocus?: string[];
+  createdAt: string;
+}
+
 export interface AgentMemory {
   visitedUrls: Set<string>;
   visitedFeatures: Set<string>;
   discoveredEntities: string[];
   explorationGoals: string[];
   currentDepth: number;
+  /** Full chronological interaction log (capped). */
+  interactionHistory: InteractionRecord[];
+  /** Compounded summaries every ~10 interactions. */
+  rollingSummaries: RollingSummary[];
+  /** Goals + latest summary focus lines fed into every navigator decision. */
+  activeInstructions: string[];
 }
 
 export interface AgentStep {

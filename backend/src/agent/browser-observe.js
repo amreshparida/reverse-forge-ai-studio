@@ -91,16 +91,59 @@ window.__reAiObserve = function(unsafePatterns) {
   }
 
   function uniqueSelector(el) {
-    if (el.id) return '#' + el.id;
+    if (el.id) return '#' + CSS.escape(el.id);
     var tag = el.tagName.toLowerCase();
+    var text = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+    // Text-scoped selectors beat generic Bootstrap class combos like button.btn.btn-sm
+    // (those often match a window.close() control first).
+    if (text) {
+      var escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      return tag + ':has-text("' + escaped + '"):visible';
+    }
+    var aria = el.getAttribute('aria-label') || el.getAttribute('title') || '';
+    if (aria) {
+      return tag + '[aria-label="' + aria.replace(/"/g, '\\"') + '"], ' + tag + '[title="' + aria.replace(/"/g, '\\"') + '"]';
+    }
     var classes = Array.from(el.classList)
-      .filter(function(c) { return !/^(ng-|css-|svelte-)/.test(c); })
-      .slice(0, 2)
+      .filter(function(c) {
+        return !/^(ng-|css-|svelte-|d-(none|sm|md|lg|xl|xxl)|hidden-|visible-|col-|row$|container|btn$|btn-sm$|btn-xs$|btn-lg$|pull-right|pull-left|top-\d+)/.test(c);
+      })
+      .slice(0, 3)
       .join('.');
     if (classes) return tag + '.' + classes;
-    var text = (el.textContent || '').trim().slice(0, 25);
-    if (text) return tag + ':has-text("' + text.replace(/"/g, "'") + '"):visible';
     return tag;
+  }
+
+  function isWindowCloseControl(el, text) {
+    var onclick = (el.getAttribute('onclick') || '') + ' ' + (el.getAttribute('href') || '');
+    if (/window\s*\.\s*close\s*\(|self\s*\.\s*close\s*\(/i.test(onclick)) return true;
+    if (/^\s*[×x✕✖]\s*$/i.test(text || '')) {
+      var cls = el.className ? el.className.toString() : '';
+      if (/close|dismiss|pull-right|btn-dark/i.test(cls)) return true;
+    }
+    var aria = (el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
+    if (/close\s*(window|tab|dialog)?/.test(aria) && /window\s*\.\s*close/i.test(onclick)) return true;
+    return false;
+  }
+
+  function isElementVisible(el) {
+    if (!el || !el.isConnected) return false;
+    if (el.disabled) return false;
+    if (el.getAttribute('aria-hidden') === 'true') return false;
+    var style = window.getComputedStyle(el);
+    if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+      return false;
+    }
+    if (typeof el.checkVisibility === 'function') {
+      try {
+        if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false;
+      } catch (e) { /* older browsers */ }
+    }
+    var rect = el.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1) return false;
+    // Off-screen responsive duplicates (common Bootstrap mobile nav clones)
+    if (rect.bottom < 0 || rect.right < 0 || rect.top > (window.innerHeight || 0) + 50) return false;
+    return true;
   }
 
   function labelFor(el) {
@@ -121,12 +164,16 @@ window.__reAiObserve = function(unsafePatterns) {
 
   function classifyPageType() {
     var url = window.location.href.toLowerCase();
-    if (/login|signin|auth/.test(url)) return 'login';
+    var title = (document.title || '').toLowerCase();
+    if (/login|signin|sign-in|auth|forgot|reset.?password/.test(url)) return 'login';
+    if (/^\s*log\s*in\s*$/i.test(title) || /sign\s*in|forgot\s*password|reset\s*password/i.test(title)) return 'login';
     if (/setting|config|preference/.test(url)) return 'settings';
     var h1 = ((document.querySelector('h1') || {}).textContent || '').toLowerCase();
     var forms = document.querySelectorAll('form, [role="form"]').length;
     var tables = document.querySelectorAll('table, [role="grid"]').length;
     var cards = document.querySelectorAll('[class*="card"], [class*="widget"]').length;
+    // Password forms on auth screens
+    if (document.querySelector('input[type="password"]') && forms > 0 && tables === 0) return 'login';
     if (forms > tables && forms > cards) return 'form';
     if (tables > 0) return 'list';
     if (cards > 2) return 'dashboard';
@@ -145,8 +192,12 @@ window.__reAiObserve = function(unsafePatterns) {
   var seen = new Set();
 
   candidates.forEach(function(el, rawIdx) {
+    if (!isElementVisible(el)) return;
     var text = labelFor(el).slice(0, 80);
     if (!text) return;
+    if (isWindowCloseControl(el, text)) return;
+    // Auth dead-ends — never explore after a successful login session
+    if (/forgot\s*password|reset\s*password|sign\s*up|create\s*account|register/i.test(text)) return;
     var key = el.tagName + ':' + text.toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);

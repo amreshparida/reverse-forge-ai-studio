@@ -1,0 +1,53 @@
+[
+  {
+    "chunk_id": "chk-1",
+    "source_id": "sec-1",
+    "text": "Admissions require transcripts and a personal statement.",
+    "source_type": "document",
+    "content_type": "document_section",
+    "document_section_id": "sec-1",
+    "heading_path": [
+      "Admissions"
+    ],
+    "topics": [
+      "top-admissions"
+    ],
+    "concepts": [
+      "con-admission"
+    ],
+    "entities": [
+      "ent-registrar"
+    ],
+    "extra_rank": 1
+  },
+  {
+    "chunk_id": "chk-2",
+    "source_id": "vid-orientation",
+    "text": "Welcome orientation covering campus life and registration.",
+    "source_type": "video",
+    "content_type": "video",
+    "video_id": "vid-orientation",
+    "topics": [
+      "top-admissions"
+    ],
+    "concepts": [
+      "con-admission"
+    ],
+    "entities": [
+      "ent-registrar"
+    ]
+  },
+  {
+    "chunk_id": "chk-3",
+    "source_id": "con-admission",
+    "text": "The concept of formal admission to the university.",
+    "source_type": "concept",
+    "content_type": "concept",
+    "concepts": [
+      "con-admission"
+    ],
+    "topics": [
+      "top-admissions"
+    ]
+  }
+]

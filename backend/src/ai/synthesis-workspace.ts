@@ -2,8 +2,9 @@ import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
 import { prisma } from '../database/client';
-import { ensureDir, writeJson, readJson, getReportsDir, getHarDir, urlToFilename } from '../utils/file-system';
+import { ensureDir, writeJson, readJson, getReportsDir, getHarDir, getUploadedEvidenceDir, urlToFilename } from '../utils/file-system';
 import { logger } from '../utils/logger';
+import { extractReadableText } from '../evidence/import-service';
 import type { PageAnalysisResult } from './analyzer';
 import { isHarLog } from './har-summary';
 
@@ -45,17 +46,29 @@ export interface GraphChunkIndexEntry {
   charLength: number;
 }
 
+export interface UploadedEvidenceIndexEntry {
+  id: string;
+  file: string;
+  filename: string;
+  sourceSessionId: string;
+  sizeBytes: number;
+  hasFullText: boolean;
+  characterCount: number;
+}
+
 export interface SynthesisWorkspace {
   root: string;
   pageAnalysesDir: string;
   networkCallsDir: string;
   harDir: string;
   graphChunksDir: string;
+  uploadedEvidenceDir: string;
   indexPath: string;
   index: PageAnalysisIndexEntry[];
   networkIndex: NetworkCallIndexEntry[];
   harIndex: HarIndexEntry[];
   graphChunkIndex: GraphChunkIndexEntry[];
+  uploadedEvidenceIndex: UploadedEvidenceIndexEntry[];
 }
 
 export function getSynthesisWorkspaceDir(projectSlug: string, sessionId: string): string {
@@ -134,7 +147,13 @@ export async function materializeEvidenceWorkspace(args: {
 }): Promise<SynthesisWorkspace> {
   const root = getSynthesisWorkspaceDir(args.projectSlug, args.sessionId);
   const priorIndex = readJson<{
-    fingerprints?: { pages?: string; networkCalls?: string; harFiles?: string; graphChunks?: string };
+    fingerprints?: {
+      pages?: string;
+      networkCalls?: string;
+      harFiles?: string;
+      graphChunks?: string;
+      uploadedEvidence?: string;
+    };
   }>(path.join(root, 'EVIDENCE-INDEX.json'));
   const sourceSessionIds = [...new Set(args.sourceSessionIds?.length ? args.sourceSessionIds : [args.sessionId])].sort();
   const validSessions = await prisma.crawlSession.findMany({
@@ -150,8 +169,10 @@ export async function materializeEvidenceWorkspace(args: {
   const networkCallsDir = ensureDir(path.join(root, 'network-calls'));
   const harDir = ensureDir(path.join(root, 'har'));
   const graphChunksDir = ensureDir(path.join(root, 'graph-chunks'));
+  const uploadedEvidenceDir = ensureDir(path.join(root, 'uploaded-evidence'));
 
   clearDir(pageAnalysesDir);
+  clearDir(uploadedEvidenceDir);
   if (args.includeNetworkCalls) {
     clearDir(networkCallsDir);
     clearDir(harDir);
@@ -339,6 +360,61 @@ export async function materializeEvidenceWorkspace(args: {
 
   }
 
+  const uploadedEvidenceIndex: UploadedEvidenceIndexEntry[] = [];
+  for (const sid of sourceSessionIds) {
+    const sessionUploadedDir = getUploadedEvidenceDir(args.projectSlug, sid);
+    if (!fs.existsSync(sessionUploadedDir)) continue;
+
+    const walkUploaded = (dir: string, relPrefix: string) => {
+      for (const name of fs.readdirSync(dir)) {
+        const abs = path.join(dir, name);
+        const stat = fs.statSync(abs);
+        if (stat.isDirectory()) {
+          walkUploaded(abs, relPrefix ? `${relPrefix}/${name}` : name);
+          continue;
+        }
+        if (!stat.isFile()) continue;
+        if (name === '_structure-inventory.json') continue;
+        const rel = relPrefix ? `${relPrefix}/${name}` : name;
+        const n = uploadedEvidenceIndex.length + 1;
+        const fileBase = safeWorkspaceFileBase(rel, 100);
+        const envelopeName = `${String(n).padStart(4, '0')}_${fileBase}.json`.slice(0, 180);
+        const id = path.basename(envelopeName, '.json');
+        const fullText = extractReadableText(abs, name);
+        writeJson(path.join(uploadedEvidenceDir, envelopeName), {
+          id,
+          filename: rel,
+          sourceSessionId: sid,
+          sizeBytes: stat.size,
+          isUserProvidedEvidence: true,
+          treatedAsPrimaryEvidence: true,
+          hasFullText: Boolean(fullText),
+          characterCount: fullText?.length ?? 0,
+          fullText: fullText ?? null,
+          note: fullText
+            ? 'Full file contents included for context building — any upload structure.'
+            : 'Binary or non-text file preserved on disk; use image OCR / linked page evidence when applicable.',
+        });
+        uploadedEvidenceIndex.push({
+          id,
+          file: envelopeName,
+          filename: rel,
+          sourceSessionId: sid,
+          sizeBytes: stat.size,
+          hasFullText: Boolean(fullText),
+          characterCount: fullText?.length ?? 0,
+        });
+      }
+    };
+    walkUploaded(sessionUploadedDir, '');
+  }
+
+  writeJson(path.join(uploadedEvidenceDir, 'index.json'), {
+    count: uploadedEvidenceIndex.length,
+    note: 'User-uploaded evidence of any type/structure — full text included when readable; used together with crawl captures',
+    files: uploadedEvidenceIndex,
+  });
+
   const indexPath = path.join(root, 'EVIDENCE-INDEX.json');
   const fingerprints = {
     pages: fingerprintFiles(pageAnalysesDir, index),
@@ -351,9 +427,16 @@ export async function materializeEvidenceWorkspace(args: {
     graphChunks: args.includeGraphChunks
       ? fingerprintFiles(graphChunksDir, graphChunkIndex)
       : priorIndex?.fingerprints?.graphChunks ?? hashText(''),
+    uploadedEvidence: fingerprintFiles(uploadedEvidenceDir, uploadedEvidenceIndex),
   };
   const coveragePath = path.join(root, 'coverage-state.json');
-  const coverage = readJson<{ pagesRead?: string[]; apisRead?: string[]; harsRead?: string[]; graphChunksRead?: string[] }>(coveragePath) ?? {};
+  const coverage = readJson<{
+    pagesRead?: string[];
+    apisRead?: string[];
+    harsRead?: string[];
+    graphChunksRead?: string[];
+    uploadedEvidenceRead?: string[];
+  }>(coveragePath) ?? {};
   const pageEvidenceChanged = priorIndex?.fingerprints?.pages !== fingerprints.pages;
   const networkEvidenceChanged = args.includeNetworkCalls
     && priorIndex?.fingerprints?.networkCalls !== fingerprints.networkCalls;
@@ -361,11 +444,13 @@ export async function materializeEvidenceWorkspace(args: {
     && priorIndex?.fingerprints?.harFiles !== fingerprints.harFiles;
   const graphEvidenceChanged = args.includeGraphChunks
     && priorIndex?.fingerprints?.graphChunks !== fingerprints.graphChunks;
+  const uploadedEvidenceChanged = priorIndex?.fingerprints?.uploadedEvidence !== fingerprints.uploadedEvidence;
   writeJson(coveragePath, {
     pagesRead: pageEvidenceChanged ? [] : coverage.pagesRead ?? [],
     apisRead: networkEvidenceChanged ? [] : coverage.apisRead ?? [],
     harsRead: harEvidenceChanged ? [] : coverage.harsRead ?? [],
     graphChunksRead: graphEvidenceChanged ? [] : coverage.graphChunksRead ?? [],
+    uploadedEvidenceRead: uploadedEvidenceChanged ? [] : coverage.uploadedEvidenceRead ?? [],
   });
   if (pageEvidenceChanged) {
     for (const name of ['working-notes.json', 'shared-evidence-meta.json']) {
@@ -384,6 +469,7 @@ export async function materializeEvidenceWorkspace(args: {
     networkCalls: networkIndex.length,
     harFiles: harIndex.length,
     graphChunks: graphChunkIndex.length,
+    uploadedEvidenceFiles: uploadedEvidenceIndex.length,
     fingerprints,
     fingerprint: hashText(JSON.stringify({ sourceSessionIds, fingerprints })),
   });
@@ -397,6 +483,7 @@ export async function materializeEvidenceWorkspace(args: {
       'network-calls/': 'Network/API captures (xhr/fetch)',
       'har/': 'Full per-page HAR 1.2 captures',
       'graph-chunks/': 'Shared analysis graph partitions',
+      'uploaded-evidence/': 'User-uploaded files of any structure (full text envelopes) — additional evidence alongside crawl captures',
       'working-notes.json': 'Shared durable notes (seeded by entity, reused by later stages)',
       'coverage-state.json': 'Read coverage tracker (pages persist across stages)',
       'shared-evidence-meta.json': 'Marker that shared page evidence was seeded',
@@ -404,7 +491,7 @@ export async function materializeEvidenceWorkspace(args: {
   });
 
   logger.info(
-    `[SynthesisWorkspace] Evidence ready: ${index.length} pages, ${networkIndex.length} APIs, ${harIndex.length} HAR files, ${graphChunkIndex.length} graph chunks → ${root}`,
+    `[SynthesisWorkspace] Evidence ready: ${index.length} pages, ${networkIndex.length} APIs, ${harIndex.length} HAR files, ${graphChunkIndex.length} graph chunks, ${uploadedEvidenceIndex.length} uploaded files → ${root}`,
   );
 
   return {
@@ -413,10 +500,12 @@ export async function materializeEvidenceWorkspace(args: {
     networkCallsDir,
     harDir,
     graphChunksDir,
+    uploadedEvidenceDir,
     indexPath,
     index,
     networkIndex,
     harIndex,
     graphChunkIndex,
+    uploadedEvidenceIndex,
   };
 }

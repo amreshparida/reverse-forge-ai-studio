@@ -1,5 +1,6 @@
 import type { LLMMessage } from '../ai/llm';
 import { SAFETY_SUMMARY } from '../crawler/safety';
+import { formatRollingContextForPrompt } from './rolling-context';
 import type { PageState, AgentAction, AgentMemory } from './types';
 
 /** Navigator prompt: given current page state + memory, select next action */
@@ -20,11 +21,14 @@ export function buildNavigatorPrompt(
     .join('\n');
 
   const recentVisits = [...memory.visitedUrls].slice(-8).join(', ');
+  const rolling = formatRollingContextForPrompt(memory);
 
   return `You are an AI agent reverse-engineering the web application "${appName}".
 Your goal: explore ALL features, modules, forms, tables, modals, and workflows to build documentation.
 
 ${SAFETY_SUMMARY}
+
+${rolling}
 
 Current page: [${state.pageType.toUpperCase()}] ${state.title}
 URL: ${state.url}
@@ -43,6 +47,7 @@ Discovered features: ${[...memory.visitedFeatures].slice(0, 10).join(', ') || 'n
 Visible text excerpt: ${state.visibleText.slice(0, 400)}
 
 Choose the BEST next action to explore new, unseen functionality.
+Use the rolling summaries + recent interaction history: continue open threads, avoid repeating covered areas, and respect active instructions.
 Priority order: navigation links > buttons that open modals/dialogs > create/edit/view form pages > detail pages > tabs/accordions > filters.
 
 Return JSON:
@@ -75,6 +80,7 @@ Rules:
 - Use send_keys mostly for Escape, Tab, ArrowDown, or Enter in search/filter contexts; never use it to submit a transactional form
 - Use scroll / scroll_to_text / scroll_to_percent when more page content may be below the fold
 - Use open_tab / switch_tab / close_tab only for read-only links or recovering useful tabs
+- In "reason", briefly connect this action to an active instruction or open thread when possible
 
 Return only valid JSON.`;
 }
@@ -84,14 +90,17 @@ export function buildPlannerPrompt(
   appName: string,
   visitedPages: Array<{ url: string; title: string; pageType: string }>,
   discoveredFeatures: string[],
+  memory?: AgentMemory,
 ): string {
   const pageSummary = visitedPages
     .slice(-20)
     .map((p) => `${p.pageType}: ${p.title} (${p.url.slice(0, 60)})`)
     .join('\n');
 
-  return `You are planning the reverse-engineering exploration of "${appName}".
+  const rolling = memory ? `\n${formatRollingContextForPrompt(memory)}\n` : '';
 
+  return `You are planning the reverse-engineering exploration of "${appName}".
+${rolling}
 Pages visited so far (${visitedPages.length} total):
 ${pageSummary}
 
@@ -99,6 +108,7 @@ Discovered features: ${discoveredFeatures.join(', ') || 'none yet'}
 
 Analyze what we've seen and identify what's MISSING from our exploration.
 A complete RE would cover: all CRUD screens, all workflows, all dashboards, all reports, settings, user management.
+Build on the rolling summaries — do not reset focus; refine goals and open threads.
 
 Return JSON:
 {
@@ -124,7 +134,7 @@ export function buildNavigatorMessages(
     {
       role: 'system',
       content:
-        'You are an expert web application reverse-engineering agent. You navigate systematically to discover all features, data models, workflows, and permissions. You always return valid JSON.',
+        'You are an expert web application reverse-engineering agent. You navigate systematically to discover all features, data models, workflows, and permissions. You use rolling exploration history and summaries to stay consistent across steps. You always return valid JSON.',
     },
     {
       role: 'user',
@@ -142,16 +152,17 @@ export function buildPlannerMessages(
   appName: string,
   visitedPages: Array<{ url: string; title: string; pageType: string }>,
   discoveredFeatures: string[],
+  memory?: AgentMemory,
 ): LLMMessage[] {
   return [
     {
       role: 'system',
       content:
-        'You are a software reverse-engineering planner. You analyze what has been explored and identify gaps.',
+        'You are a software reverse-engineering planner. You analyze what has been explored and identify gaps, using rolling summaries as durable memory.',
     },
     {
       role: 'user',
-      content: buildPlannerPrompt(appName, visitedPages, discoveredFeatures),
+      content: buildPlannerPrompt(appName, visitedPages, discoveredFeatures, memory),
     },
   ];
 }

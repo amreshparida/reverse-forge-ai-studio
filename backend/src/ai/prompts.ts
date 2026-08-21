@@ -237,6 +237,28 @@ Describe in structured JSON what you see:
 Return only valid JSON.`;
 }
 
+export function buildImageOcrPrompt(contextLabel: string, sourcePath: string): string {
+  return `You are performing OCR and visual analysis on an evidence image uploaded for enterprise reverse-engineering.
+Context: ${contextLabel}
+Source path: ${sourcePath}
+
+Extract ALL readable text from the image (OCR) and describe visual structure.
+Return JSON only:
+{
+  "extractedText": "Full verbatim text visible in the image, preserving line breaks where helpful. Empty string if no text.",
+  "visualDescription": "What the image shows (diagram, form, screenshot, chart, photo, etc.)",
+  "detectedElements": ["headings", "labels", "buttons", "tables", "charts", "logos", "other UI or document elements"],
+  "documentType": "screenshot|diagram|form|table|chart|photo|scan|other",
+  "language": "primary language if detectable",
+  "confidenceScore": 0.0
+}
+
+Rules:
+- extractedText must include every legible word, number, and label — treat this as primary evidence.
+- Do not invent text that is not visible.
+- For diagrams, include text inside boxes/labels and describe relationships in visualDescription.`;
+}
+
 export function buildArchitectureInferencePrompt(
   pageAnalyses: unknown[],
   networkCalls: unknown[],

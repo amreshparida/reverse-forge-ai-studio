@@ -13,6 +13,8 @@ import { crawlsRouter, registerJobHandlers } from './routes/crawls';
 import { pagesRouter } from './routes/pages';
 import { analysisRouter } from './routes/analysis';
 import { reportsRouter } from './routes/reports';
+import { evidenceRouter, registerEvidenceJobHandlers } from './routes/evidence';
+import { knowledgeRouter } from './routes/knowledge';
 import { jobQueue } from '../queue/job-queue';
 import { ensureDir } from '../utils/file-system';
 import { crawlLogBus } from '../crawler/live-log';
@@ -79,6 +81,8 @@ app.use('/api/projects/:projectId/crawls', crawlsRouter);
 app.use('/api/projects/:projectId/crawls/:sessionId/pages', pagesRouter);
 app.use('/api/projects/:projectId/analysis', analysisRouter);
 app.use('/api/projects/:projectId/reports', reportsRouter);
+app.use('/api/projects/:projectId/evidence', evidenceRouter);
+app.use('/api/projects/:projectId/knowledge', knowledgeRouter);
 
 // ── SSE endpoint for real-time job progress ───────────────────────────────
 app.get('/api/events', (req, res) => {
@@ -157,6 +161,7 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
 async function start(): Promise<void> {
   await connectDatabase();
   registerJobHandlers();
+  registerEvidenceJobHandlers();
   jobQueue.setMaxConcurrent(config.crawler.maxConcurrency);
 
   ensureDir(config.outputDir);

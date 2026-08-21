@@ -34,6 +34,8 @@ export default function ProjectDetail() {
   const [msg, setMsg] = useState<string | null>(null);
   const [deleteSession, setDeleteSession] = useState<CrawlSession | null>(null);
   const [markingCompleteId, setMarkingCompleteId] = useState<string | null>(null);
+  const [uploadLoading, setUploadLoading] = useState(false);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
 
   const load = () => {
     if (!projectId) return;
@@ -121,6 +123,23 @@ export default function ProjectDetail() {
       setMsg(e instanceof Error ? e.message : 'Failed to extract report');
     } finally {
       setReportLoading(false);
+    }
+  };
+
+  const handleUploadEvidence = async () => {
+    if (!projectId || selectedFiles.length === 0) return;
+    setUploadLoading(true);
+    setMsg(null);
+    setError(null);
+    try {
+      const res = await api.uploadEvidence(projectId, selectedFiles);
+      setMsg(res.message);
+      setSelectedFiles([]);
+      load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to upload evidence');
+    } finally {
+      setUploadLoading(false);
     }
   };
 
@@ -222,6 +241,44 @@ export default function ProjectDetail() {
         </div>
       )}
 
+      <div className="card mb-6 border-violet-200 bg-violet-50/40">
+        <h2 className="font-semibold text-gray-900 mb-1">Upload Evidence</h2>
+        <p className="text-sm text-gray-600 mb-4">
+          Upload any files, folders (as ZIP), documents, crawl exports, or mixed archives — any type or
+          folder structure. Uploads are merged with crawler captures as additional evidence for analysis
+          and reports (they do not replace crawl data). Recognized structured knowledge-base packages are
+          also indexed when present; they are optional, not required.
+        </p>
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="btn-secondary cursor-pointer">
+            Choose files
+            <input
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                setSelectedFiles(Array.from(e.target.files ?? []));
+              }}
+            />
+          </label>
+          {selectedFiles.length > 0 && (
+            <span className="text-sm text-gray-600">
+              {selectedFiles.length} file{selectedFiles.length === 1 ? '' : 's'} selected
+              {' '}({selectedFiles.map((f) => f.name).slice(0, 3).join(', ')}
+              {selectedFiles.length > 3 ? '…' : ''})
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => { void handleUploadEvidence(); }}
+            disabled={uploadLoading || selectedFiles.length === 0}
+            className="btn-primary"
+          >
+            {uploadLoading ? 'Uploading…' : 'Upload as Evidence'}
+          </button>
+        </div>
+      </div>
+
       {activeSessions.length > 0 && (
         <div className="mb-6 space-y-2">
           {activeSessions.map((session) => (
@@ -317,6 +374,11 @@ export default function ProjectDetail() {
                       <div className="flex items-center justify-between gap-3">
                         <div>
                           <div className="text-sm font-medium text-gray-900">
+                            {session.sourceType === 'upload' ? (
+                              <span className="mr-2 rounded bg-violet-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-violet-700">
+                                Upload
+                              </span>
+                            ) : null}
                             {session.pagesCount > 0 ? session.pagesCount : (session._count?.pages ?? 0)} pages
                             {(session.status === 'running' ||
                               session.status === 'pending' ||

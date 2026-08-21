@@ -50,11 +50,78 @@ function isOverlayPage(page: Page): boolean {
   }
 }
 
+const CLOSE_GUARD_SOURCE = `
+(function() {
+  if (window.__RE_AI_CLOSE_GUARD__) return;
+  window.__RE_AI_CLOSE_GUARD__ = true;
+  var noop = function() {
+    try { console.warn('[RE-AI] Blocked window.close() during crawl'); } catch (e) {}
+  };
+  try { window.close = noop; } catch (e) {}
+  try {
+    Object.defineProperty(window, 'close', { configurable: true, writable: true, value: noop });
+  } catch (e) {}
+  try {
+    if (window.top && window.top !== window) {
+      try { window.top.close = noop; } catch (e2) {}
+    }
+  } catch (e) {}
+  try {
+    if (window.opener && typeof window.opener.close === 'function') {
+      try { window.opener.close = noop; } catch (e2) {}
+    }
+  } catch (e) {}
+})();
+`;
+
+const windowCloseGuarded = new WeakSet<BrowserContext>();
+
+/**
+ * Essential Viewer / report links often call window.close() on the portal tab.
+ * That quits headed Chromium when it was the last window — aborting Manual Crawl.
+ */
+export async function installWindowCloseGuard(context: BrowserContext): Promise<void> {
+  if (windowCloseGuarded.has(context)) return;
+  windowCloseGuarded.add(context);
+
+  await context.addInitScript({ content: CLOSE_GUARD_SOURCE }).catch(() => undefined);
+
+  const inject = async (page: Page) => {
+    if (page.isClosed() || isOverlayPage(page)) return;
+    await page.addInitScript({ content: CLOSE_GUARD_SOURCE }).catch(() => undefined);
+    await page.evaluate(CLOSE_GUARD_SOURCE).catch(() => undefined);
+  };
+
+  for (const page of context.pages()) {
+    await inject(page);
+  }
+  context.on('page', (page) => {
+    void inject(page);
+    page.on('close', () => {
+      void (async () => {
+        try {
+          if (!context.browser()?.isConnected()) return;
+          const alive = context.pages().filter((p) => !p.isClosed());
+          if (alive.length === 0) {
+            logger.warn('[Safety] Last tab closed — opening blank keep-alive tab');
+            await context.newPage();
+          }
+        } catch {
+          /* browser already gone */
+        }
+      })();
+    });
+  });
+
+  logger.info('[Safety] window.close() guard installed');
+}
+
 /**
  * Install context-wide guards that prevent navigating to or clicking
  * logout / session-end controls. Safe to call once per crawl context.
  */
 export async function installSessionEndGuard(context: BrowserContext): Promise<void> {
+  await installWindowCloseGuard(context);
   // Abort top-level document navigations to logout / SSO end URLs
   await context.route('**/*', async (route) => {
     try {

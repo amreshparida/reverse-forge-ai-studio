@@ -3,6 +3,10 @@ backend/node_modules/
 backend/dist/
 backend/dev.db
 backend/dev.db-journal
+backend/prisma/dev.db
+backend/prisma/dev.db-journal
+*.db
+*.db-journal
 backend/project-output/
 backend/sessions/
 backend/logs/

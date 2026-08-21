@@ -40,6 +40,7 @@ interface CoverageState {
   apisRead: string[];
   harsRead: string[];
   graphChunksRead: string[];
+  uploadedEvidenceRead: string[];
 }
 
 export interface CoverageSnapshot {
@@ -47,6 +48,7 @@ export interface CoverageSnapshot {
   apis: { total: number; read: number; unread: number };
   hars: { total: number; read: number; unread: number };
   graphChunks: { total: number; read: number; unread: number };
+  uploadedEvidence: { total: number; read: number; unread: number };
   complete: boolean;
 }
 
@@ -55,6 +57,7 @@ export interface CoverageRequirements {
   requireAllApis?: boolean;
   requireAllHars?: boolean;
   requireAllGraphChunks?: boolean;
+  requireAllUploadedEvidence?: boolean;
 }
 
 function createClient(cfg?: LLMConfig): { client: OpenAI; model: string; baseUrl?: string } {
@@ -126,6 +129,7 @@ function estimateRemainingSteps(
   if (req.requireAllApis) reads += Math.ceil(snap.apis.unread / 25);
   if (req.requireAllHars) reads += Math.ceil(snap.hars.unread / 5);
   if (req.requireAllGraphChunks) reads += Math.ceil(snap.graphChunks.unread / 10);
+  if (req.requireAllUploadedEvidence) reads += Math.ceil(snap.uploadedEvidence.unread / 8);
   return reads + (snap.complete ? 20 : 15);
 }
 
@@ -137,6 +141,7 @@ function loadCoverage(workspace: SynthesisWorkspace): CoverageState {
     apisRead: existing?.apisRead ?? [],
     harsRead: existing?.harsRead ?? [],
     graphChunksRead: existing?.graphChunksRead ?? [],
+    uploadedEvidenceRead: existing?.uploadedEvidenceRead ?? [],
   };
 }
 
@@ -169,33 +174,49 @@ function snapshotCoverage(
     read: state.graphChunksRead.length,
     unread: Math.max(0, workspace.graphChunkIndex.length - state.graphChunksRead.length),
   };
+  const uploadedEvidence = {
+    total: workspace.uploadedEvidenceIndex.length,
+    read: state.uploadedEvidenceRead.length,
+    unread: Math.max(0, workspace.uploadedEvidenceIndex.length - state.uploadedEvidenceRead.length),
+  };
 
   const complete =
     (!req.requireAllPages || pages.unread === 0) &&
     (!req.requireAllApis || apis.unread === 0) &&
     (!req.requireAllHars || hars.unread === 0) &&
-    (!req.requireAllGraphChunks || graphChunks.unread === 0);
+    (!req.requireAllGraphChunks || graphChunks.unread === 0) &&
+    (!req.requireAllUploadedEvidence || uploadedEvidence.unread === 0);
 
-  return { pages, apis, hars, graphChunks, complete };
+  return { pages, apis, hars, graphChunks, uploadedEvidence, complete };
 }
 
 function defaultRequirements(task: SynthesisTask): CoverageRequirements {
   switch (task) {
     case 'architecture':
-      return { requireAllPages: true, requireAllApis: true, requireAllHars: true };
+      return {
+        requireAllPages: true,
+        requireAllApis: true,
+        requireAllHars: true,
+        requireAllUploadedEvidence: true,
+      };
     case 'deep-research':
-      return { requireAllPages: false, requireAllApis: true, requireAllHars: true };
+      return {
+        requireAllPages: false,
+        requireAllApis: true,
+        requireAllHars: true,
+        requireAllUploadedEvidence: true,
+      };
     case 'knowledge-graph':
       // Structural scaffold already indexes every page/API from the workspace catalogs.
       // Only need shared page coverage (notes); do not re-drain all APIs/HARs.
-      return { requireAllPages: true, requireAllApis: false, requireAllHars: false };
+      return { requireAllPages: true, requireAllApis: false, requireAllHars: false, requireAllUploadedEvidence: true };
     case 'specialist':
-      return { requireAllGraphChunks: true };
+      return { requireAllGraphChunks: true, requireAllUploadedEvidence: true };
     case 'entity':
     case 'workflow':
     case 'permission':
     default:
-      return { requireAllPages: true };
+      return { requireAllPages: true, requireAllUploadedEvidence: true };
   }
 }
 
@@ -205,7 +226,7 @@ function buildTools(allowedArtifacts: string[]): ChatCompletionTool[] {
       type: 'function',
       function: {
         name: 'get_coverage',
-        description: 'Show how many pages/APIs/HARs/graph-chunks are still unread. Must reach complete=true before write_artifact.',
+        description: 'Show how many pages/APIs/HARs/graph-chunks/uploaded-evidence files are still unread. Must reach complete=true before write_artifact.',
         parameters: { type: 'object', properties: {}, additionalProperties: false },
       },
     },
@@ -238,6 +259,14 @@ function buildTools(allowedArtifacts: string[]): ChatCompletionTool[] {
       function: {
         name: 'list_graph_chunks',
         description: 'Catalog of shared analysis-graph chunk files.',
+        parameters: { type: 'object', properties: {}, additionalProperties: false },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'list_uploaded_evidence',
+        description: 'Catalog of user-uploaded evidence files of any type/structure (additional evidence alongside crawl captures).',
         parameters: { type: 'object', properties: {}, additionalProperties: false },
       },
     },
@@ -285,6 +314,19 @@ function buildTools(allowedArtifacts: string[]): ChatCompletionTool[] {
         parameters: {
           type: 'object',
           properties: { limit: { type: 'number', description: 'Batch size (default 10, max 20)' } },
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'read_next_unread_uploaded_evidence',
+        description:
+          'Read the next batch of UNREAD uploaded evidence files (any type/structure, full text when available) and mark them read. Use until uploadedEvidence.unread=0.',
+        parameters: {
+          type: 'object',
+          properties: { limit: { type: 'number', description: 'Batch size (default 8, max 15)' } },
           additionalProperties: false,
         },
       },
@@ -567,17 +609,20 @@ function runTool(
   const apisRead = new Set(coverage.apisRead);
   const harsRead = new Set(coverage.harsRead);
   const graphRead = new Set(coverage.graphChunksRead);
+  const uploadedRead = new Set(coverage.uploadedEvidenceRead);
 
   const markPages = (ids: string[]) => ids.forEach((id) => pagesRead.add(id));
   const markApis = (ids: string[]) => ids.forEach((id) => apisRead.add(id));
   const markHars = (ids: string[]) => ids.forEach((id) => harsRead.add(id));
   const markGraph = (ids: string[]) => ids.forEach((id) => graphRead.add(id));
+  const markUploaded = (ids: string[]) => ids.forEach((id) => uploadedRead.add(id));
 
   const nextCoverage = (): CoverageState => ({
     pagesRead: [...pagesRead],
     apisRead: [...apisRead],
     harsRead: [...harsRead],
     graphChunksRead: [...graphRead],
+    uploadedEvidenceRead: [...uploadedRead],
   });
 
   try {
@@ -610,6 +655,16 @@ function runTool(
     if (name === 'list_graph_chunks') {
       return {
         result: JSON.stringify({ count: workspace.graphChunkIndex.length, chunks: workspace.graphChunkIndex }, null, 2),
+        coverage,
+      };
+    }
+
+    if (name === 'list_uploaded_evidence') {
+      return {
+        result: JSON.stringify({
+          count: workspace.uploadedEvidenceIndex.length,
+          files: workspace.uploadedEvidenceIndex,
+        }, null, 2),
         coverage,
       };
     }
@@ -700,6 +755,33 @@ function runTool(
       return {
         result: JSON.stringify({
           returned: items.length,
+          coverage: snapshotCoverage(workspace, cov, req),
+          items,
+        }),
+        coverage: cov,
+      };
+    }
+
+    if (name === 'read_next_unread_uploaded_evidence') {
+      const limit = Math.min(15, Math.max(1, Number(args['limit'] ?? 8) || 8));
+      const unread = workspace.uploadedEvidenceIndex.filter((p) => !uploadedRead.has(p.id)).slice(0, limit);
+      const items: unknown[] = [];
+      const errors: string[] = [];
+      for (const entry of unread) {
+        try {
+          const abs = resolveWorkspacePath(workspace.root, path.join('uploaded-evidence', entry.file));
+          items.push(JSON.parse(fs.readFileSync(abs, 'utf-8')));
+          markUploaded([entry.id]);
+        } catch (err) {
+          markUploaded([entry.id]);
+          errors.push(`${entry.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      const cov = nextCoverage();
+      return {
+        result: JSON.stringify({
+          returned: items.length,
+          skippedErrors: errors.length ? errors : undefined,
           coverage: snapshotCoverage(workspace, cov, req),
           items,
         }),
@@ -883,7 +965,9 @@ function compactMessages(
 
   const system = messages[0];
   const drainHint =
-    coverageSnap.pages.unread === 0 && coverageSnap.apis.unread > 0
+    coverageSnap.uploadedEvidence.unread > 0
+      ? `Call read_next_unread_uploaded_evidence (limit=8) — ${coverageSnap.uploadedEvidence.unread} uploaded evidence files unread. Merge them with crawl captures (do not treat uploads as the only source).`
+      : coverageSnap.pages.unread === 0 && coverageSnap.apis.unread > 0
       ? `Pages are done. Call read_next_unread_apis (limit=25) — ${coverageSnap.apis.unread} APIs unread. Do NOT call read_page_analysis.`
       : coverageSnap.pages.unread === 0 && coverageSnap.hars.unread > 0
         ? `Pages are done. Call read_next_unread_hars (limit=5) — ${coverageSnap.hars.unread} HAR files unread. Do NOT call read_page_analysis.`
@@ -1217,7 +1301,7 @@ export async function runSynthesisAgent<T>(args: {
 
   if (args.task === 'entity' || (!wantReuse && args.task !== 'specialist')) {
     // Fresh page drain — seeds shared notes for later stages
-    coverage = { pagesRead: [], apisRead: [], harsRead: [], graphChunksRead: [] };
+    coverage = { pagesRead: [], apisRead: [], harsRead: [], graphChunksRead: [], uploadedEvidenceRead: [] };
     writeJson(resolveWorkspacePath(args.workspace.root, 'working-notes.json'), { notes: [] });
   } else if (args.task === 'specialist') {
     if (sharedGraphReady) {
@@ -1234,6 +1318,7 @@ export async function runSynthesisAgent<T>(args: {
         apisRead: coverage.apisRead,
         harsRead: coverage.harsRead,
         graphChunksRead: [],
+        uploadedEvidenceRead: req.requireAllUploadedEvidence ? [] : coverage.uploadedEvidenceRead,
       };
       // Independent specialists must not inherit another specialist's interpretation.
       if (!wantReuse || loadWorkingNotes(args.workspace).notes.length === 0) {
@@ -1242,11 +1327,20 @@ export async function runSynthesisAgent<T>(args: {
     }
   } else if (sharedPagesReady) {
     // Keep pagesRead + working notes; reset only newly required evidence streams
+    const uploadsFullyRead =
+      args.workspace.uploadedEvidenceIndex.length === 0
+      || coverage.uploadedEvidenceRead.length >= args.workspace.uploadedEvidenceIndex.length;
     coverage = {
       pagesRead: coverage.pagesRead,
       apisRead: req.requireAllApis ? [] : coverage.apisRead,
       harsRead: req.requireAllHars ? [] : coverage.harsRead,
       graphChunksRead: req.requireAllGraphChunks ? [] : coverage.graphChunksRead,
+      uploadedEvidenceRead:
+        req.requireAllUploadedEvidence && uploadsFullyRead
+          ? coverage.uploadedEvidenceRead
+          : req.requireAllUploadedEvidence
+            ? []
+            : coverage.uploadedEvidenceRead,
     };
     logger.info(
       `[SynthesisAgent] ${args.task}: reusing shared page coverage (${coverage.pagesRead.length}/${args.workspace.index.length}) + ${loadWorkingNotes(args.workspace).notes.length} notes — skipping page re-read`,
@@ -1258,6 +1352,7 @@ export async function runSynthesisAgent<T>(args: {
       apisRead: req.requireAllApis ? [] : coverage.apisRead,
       harsRead: req.requireAllHars ? [] : coverage.harsRead,
       graphChunksRead: req.requireAllGraphChunks ? [] : coverage.graphChunksRead,
+      uploadedEvidenceRead: req.requireAllUploadedEvidence ? [] : coverage.uploadedEvidenceRead,
     };
     logger.info(
       `[SynthesisAgent] ${args.task}: continuing shared coverage (${coverage.pagesRead.length} pages already read, notes=${loadWorkingNotes(args.workspace).notes.length})`,
@@ -1361,7 +1456,9 @@ export async function runSynthesisAgent<T>(args: {
     const snapBefore = snapshotCoverage(args.workspace, coverage, req);
     if (!snapBefore.complete && stallCount >= 3) {
       const drainTool =
-        req.requireAllApis && snapBefore.apis.unread > 0
+        req.requireAllUploadedEvidence && snapBefore.uploadedEvidence.unread > 0
+          ? 'read_next_unread_uploaded_evidence'
+          : req.requireAllApis && snapBefore.apis.unread > 0
           ? 'read_next_unread_apis'
           : req.requireAllHars && snapBefore.hars.unread > 0
             ? 'read_next_unread_hars'
@@ -1376,7 +1473,13 @@ export async function runSynthesisAgent<T>(args: {
           args.workspace,
           drainTool,
           JSON.stringify({
-            limit: drainTool.includes('apis') ? 25 : drainTool.includes('pages') ? 16 : 10,
+            limit: drainTool.includes('apis')
+              ? 25
+              : drainTool.includes('pages')
+                ? 16
+                : drainTool.includes('uploaded')
+                  ? 8
+                  : 10,
           }),
           coverage,
           req,
@@ -1525,6 +1628,11 @@ export async function runSynthesisAgent<T>(args: {
       messages.push({
         role: 'user',
         content: `STOP re-reading pages. pages.unread=0 but hars.unread=${snap.hars.unread}. Call read_next_unread_hars with limit=5 now, then write_artifact "${args.expectedArtifact}" when complete.`,
+      });
+    } else if (!wrote && req.requireAllUploadedEvidence && snap.uploadedEvidence.unread > 0) {
+      messages.push({
+        role: 'user',
+        content: `Call read_next_unread_uploaded_evidence (limit=8). uploadedEvidence.unread=${snap.uploadedEvidence.unread}. Use uploaded files as additional evidence alongside crawler captures — not instead of them.`,
       });
     } else if (!wrote && snap.pages.unread === 0 && req.requireAllGraphChunks && snap.graphChunks.unread > 0) {
       messages.push({

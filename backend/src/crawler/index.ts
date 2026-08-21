@@ -11,6 +11,7 @@ import { emitCrawlLog } from './live-log';
 import { attachLiveLogOverlay, hideLiveLogOverlay, showLiveLogOverlay, isLiveLogOverlayPage, type LogOverlayHandle } from './log-overlay';
 import { installSessionEndGuard } from './session-end-guard';
 import { crawlAbortRegistry } from './crawl-abort';
+import { installNewPageFollower, waitForPageSettled, isBlankOrNewTabUrl } from './new-page-follower';
 import { extractJsIntelligence } from '../extractor/js-intelligence';
 import {
   fetchGraphQLSchema,
@@ -56,6 +57,7 @@ interface QueueEntry {
   url: string;
   depth: number;
   parentUrl?: string;
+  sourcePage?: Page;
 }
 
 /** Absolute path to the output dir — used to compute /static/ URLs for screenshots */
@@ -94,6 +96,13 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
   let wsRecorder: ReturnType<typeof createWebSocketRecorder> | null = null;
   /** Headed browser (login always headed, or CRAWL_HEADLESS=false) */
   let headed = false;
+  let lastDepth = 0;
+  const consoleEntries: Array<{ type: 'error' | 'warning' | 'info' | 'log'; text: string }> = [];
+  let newPageFollower: ReturnType<typeof installNewPageFollower> | null = null;
+  const pageRecorders = new WeakMap<Page, {
+    network: ReturnType<typeof createNetworkRecorder> | null;
+    ws: ReturnType<typeof createWebSocketRecorder> | null;
+  }>();
 
   // Default allowed domain from base URL
   try {
@@ -193,9 +202,50 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
 
     await installSessionEndGuard(context!);
 
+    const attachRecorders = (target: Page) => {
+      if (pageRecorders.has(target)) return pageRecorders.get(target)!;
+      const network = project.networkCaptureEnabled ? createNetworkRecorder(target) : null;
+      const ws = createWebSocketRecorder(target);
+      target.on('console', (msg) => {
+        const t = msg.type() as 'error' | 'warning' | 'info' | 'log';
+        if (t === 'error' || t === 'warning') {
+          consoleEntries.push({ type: t, text: msg.text().slice(0, 500) });
+        }
+      });
+      const bundle = { network, ws };
+      pageRecorders.set(target, bundle);
+      return bundle;
+    };
+
+    const bindWorkingPage = (next: Page) => {
+      newPageFollower?.claimPage(next);
+      if (next === crawlPage) return;
+      // Keep prior tab recorders alive until that tab is closed; only swap active refs.
+      crawlPage = next;
+      const bundle = attachRecorders(crawlPage);
+      networkRecorder = bundle.network;
+      wsRecorder = bundle.ws;
+    };
+
     await crawlPage.addInitScript(() => {
       document.addEventListener('submit', (e) => { e.preventDefault(); e.stopImmediatePropagation(); }, true);
     }).catch(() => undefined);
+
+    newPageFollower = installNewPageFollower(context!, {
+      onPageCreated: (opened) => {
+        attachRecorders(opened);
+      },
+      onNewPage: (opened, openedUrl) => {
+        if (isBlankOrNewTabUrl(openedUrl) || !isUrlSafe(openedUrl, allowedDomains, excludedUrls)) return;
+        const norm = normalizeUrl(openedUrl);
+        if (visited.has(norm)) return;
+        if (queue.some((entry) => normalizeUrl(entry.url) === norm)) return;
+        const depth = Math.min(lastDepth + 1, maxDepth);
+        queue.unshift({ url: openedUrl, depth, parentUrl: crawlPage.url(), sourcePage: opened });
+        logger.info(`[BFS] Queued new tab/window at depth ${depth}: ${openedUrl}`);
+        emitCrawlLog(session.id, 'info', `Followed new tab/window: ${openedUrl}`, { queuedCount: queue.length });
+      },
+    });
 
     // Transparent live-log panel inside the browser (headed mode only)
     if (headed && context) {
@@ -203,18 +253,13 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
       emitCrawlLog(session.id, 'info', 'Live crawl log overlay attached to browser window');
     }
 
-    // Attach recorders ONCE
-    networkRecorder = project.networkCaptureEnabled ? createNetworkRecorder(crawlPage) : null;
-    wsRecorder = createWebSocketRecorder(crawlPage);
-
-    // Attach console recorder ONCE — reset between pages
-    const consoleEntries: Array<{ type: 'error' | 'warning' | 'info' | 'log'; text: string }> = [];
-    crawlPage.on('console', (msg) => {
-      const t = msg.type() as 'error' | 'warning' | 'info' | 'log';
-      if (t === 'error' || t === 'warning') {
-        consoleEntries.push({ type: t, text: msg.text().slice(0, 500) });
-      }
-    });
+    // Attach recorders ONCE for the primary tab
+    {
+      const bundle = attachRecorders(crawlPage);
+      networkRecorder = bundle.network;
+      wsRecorder = bundle.ws;
+      newPageFollower.claimPage(crawlPage);
+    }
 
     while (queue.length > 0) {
       if (abortSignal?.aborted) {
@@ -228,6 +273,7 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
 
       const entry = queue.shift()!;
       const { url, depth } = entry;
+      lastDepth = depth;
 
       const normalizedUrl = normalizeUrl(url);
       if (visited.has(normalizedUrl)) continue;
@@ -252,8 +298,25 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
 
       logger.info(`Crawling [${depth}/${maxDepth}]: ${normalizedUrl}`);
 
-      // Reset per-page accumulators (reuse same tab — no new page!)
-      await networkRecorder?.reset();
+      const followPage = entry.sourcePage && !entry.sourcePage.isClosed()
+        ? entry.sourcePage
+        : newPageFollower?.consumeLivePage(url);
+      const adoptedExistingTab = Boolean(followPage && !followPage.isClosed());
+      if (followPage && !followPage.isClosed()) {
+        bindWorkingPage(followPage);
+        await waitForPageSettled(followPage).catch(() => undefined);
+        await followPage.bringToFront().catch(() => undefined);
+      } else if (crawlPage.isClosed()) {
+        const fallback =
+          context!.pages().filter((p) => !p.isClosed() && !isLiveLogOverlayPage(p))[0]
+          ?? await context!.newPage();
+        bindWorkingPage(fallback);
+      }
+
+      // Reset only when navigating in an already-owned tab. Keep traffic for newly followed tabs.
+      if (!adoptedExistingTab) {
+        await networkRecorder?.reset();
+      }
       consoleEntries.length = 0;
 
       const pageStartTime = Date.now();
@@ -262,9 +325,8 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
       });
 
       try {
-        // Skip navigation if already on this URL (e.g. first page after login)
-        // Navigating to the same URL can trigger app redirects that open new tabs
-        const alreadyThere = normalizeUrl(crawlPage.url()) === normalizedUrl;
+        // Skip navigation if already on this URL (e.g. first page after login or a followed tab)
+        const alreadyThere = normalizeUrl(crawlPage.url()) === normalizedUrl || Boolean(followPage);
         let response = null;
 
         if (!alreadyThere) {
@@ -272,6 +334,13 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
             waitUntil: 'domcontentloaded',
             timeout: config.crawler.timeoutMs,
           });
+          // Only adopt a spawned tab if it matches this navigation target.
+          const spawned = newPageFollower?.takePendingForUrl(normalizedUrl);
+          if (spawned && !spawned.isClosed()) {
+            await waitForPageSettled(spawned);
+            bindWorkingPage(spawned);
+            await spawned.bringToFront().catch(() => undefined);
+          }
         } else {
           logger.info(`Already on ${normalizedUrl} — skipping navigation`);
         }
@@ -586,6 +655,7 @@ export async function runCrawl(options: CrawlOptions): Promise<void> {
   } finally {
     await networkRecorder?.stop();
     wsRecorder?.stop();
+    newPageFollower?.dispose();
     logOverlay?.dispose();
     await context?.close().catch(() => undefined);
     await browser?.close().catch(() => undefined);

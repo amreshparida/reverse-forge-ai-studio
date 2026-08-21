@@ -1,0 +1,15 @@
+[
+  {
+    "document_section_id": "sec-1",
+    "video_id": "vid-orientation",
+    "bundle_name": "orientation-bundle",
+    "resolved": true
+  },
+  {
+    "document_section_id": "sec-missing",
+    "video_id": null,
+    "bundle_name": null,
+    "resolved": false,
+    "reason": "no matching video transcript"
+  }
+]

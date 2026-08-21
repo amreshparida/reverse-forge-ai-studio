@@ -129,4 +129,32 @@ export const api = {
     `/api/projects/${projectId}/reports/export/latest`,
   exportSession: (projectId: string, sessionId: string) =>
     `/api/projects/${projectId}/reports/export/${sessionId}`,
+
+  // Evidence upload
+  uploadEvidence: (projectId: string, files: File[]) => {
+    const formData = new FormData();
+    for (const file of files) {
+      formData.append('files', file);
+    }
+    const apiToken = typeof window !== 'undefined'
+      ? window.sessionStorage.getItem('reverseforge-api-token')
+      : null;
+    return fetch(`${BASE_URL}/projects/${projectId}/evidence/upload`, {
+      method: 'POST',
+      headers: {
+        ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
+      },
+      body: formData,
+    }).then(async (res) => {
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText })) as { error?: string };
+        throw new Error(err.error ?? `HTTP ${res.status}`);
+      }
+      return res.json() as Promise<{
+        session: import('../types').CrawlSession;
+        jobId: string;
+        message: string;
+      }>;
+    });
+  },
 };

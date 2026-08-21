@@ -1,0 +1,5 @@
+{"id": "sec-1", "label": "Admissions Overview", "type": "document_section"}
+{"id": "vid-orientation", "label": "Orientation Video", "type": "video"}
+{"id": "top-admissions", "label": "Admissions", "type": "topic"}
+{"id": "con-admission", "label": "Admission Concept", "type": "concept"}
+{"id": "ent-registrar", "label": "Registrar", "type": "entity"}

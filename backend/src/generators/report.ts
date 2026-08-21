@@ -18,6 +18,8 @@ import type { PermissionMatrix } from '../inference/permissions';
 import type { LLMConfig } from '../ai/llm';
 import type { GenerationStageId } from './checkpoint';
 import { writeRedevelopmentBundle } from './redevelopment-bundle';
+import { loadUploadedEvidenceForAnalysis, loadKnowledgeBaseEvidenceForAnalysis } from '../evidence/import-service';
+import { loadAllImageOcrForSessions } from '../evidence/image-analysis';
 
 type ExpertReportAnalysis = Record<string, unknown>;
 type CompletenessAudit = Record<string, unknown>;
@@ -250,6 +252,9 @@ async function buildCompleteEvidencePackage(ctx: ReportContext, networkCallsTota
   const { loadHarFilesForSessions } = await import('../ai/har-summary.js');
   const harFiles = loadHarFilesForSessions(ctx.projectSlug, sourceSessionIds, 60);
   const harArtifactCount = artifactFiles.filter((f) => f['folder'] === 'har' || String(f['extension']) === '.har').length;
+  const uploadedEvidence = loadUploadedEvidenceForAnalysis(ctx.projectSlug, sourceSessionIds);
+  const knowledgeBaseEvidence = await loadKnowledgeBaseEvidenceForAnalysis(ctx.projectSlug, sourceSessionIds);
+  const imageOcrEvidence = loadAllImageOcrForSessions(ctx.projectSlug, sourceSessionIds);
 
   return {
     project: {
@@ -315,6 +320,21 @@ async function buildCompleteEvidencePackage(ctx: ReportContext, networkCallsTota
       totalFiles: artifactFiles.length,
       // hashes/paths only — no file bodies; cap listing size
       files: artifactFiles.slice(0, 500),
+    },
+    uploadedEvidence: {
+      totalFiles: uploadedEvidence.length,
+      note: 'User-uploaded files and extracted zip contents — additional evidence merged with crawler captures for analysis and report generation.',
+      files: uploadedEvidence,
+    },
+    knowledgeBaseEvidence: {
+      totalPackages: knowledgeBaseEvidence.length,
+      note: 'Optional: when an upload matches a structured knowledge-base layout, records/chunks/graph/markdown are indexed losslessly in addition to the raw files. Any other upload structure is still fully read via uploadedEvidence.',
+      packages: knowledgeBaseEvidence,
+    },
+    imageOcrEvidence: {
+      totalImages: imageOcrEvidence.length,
+      note: 'Vision/OCR extraction from uploaded evidence images, knowledge-base assets (document-images, video-frames), and page screenshots.',
+      results: imageOcrEvidence,
     },
     completenessAudit,
     inferredModels: {

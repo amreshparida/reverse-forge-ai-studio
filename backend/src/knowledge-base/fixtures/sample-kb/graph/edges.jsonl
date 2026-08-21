@@ -1,0 +1,4 @@
+{"id": "e1", "from": "sec-1", "to": "vid-orientation", "relationship": "REFERENCES"}
+{"id": "e2", "from": "vid-orientation", "to": "top-admissions", "relationship": "HAS_TOPIC"}
+{"id": "e3", "from": "vid-orientation", "to": "con-admission", "relationship": "HAS_CONCEPT"}
+{"id": "e4", "from": "vid-orientation", "to": "ent-registrar", "relationship": "HAS_ENTITY"}

@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0.0",
+  "primary_paths": {
+    "knowledge_jsonl": "structured/knowledge.jsonl",
+    "chunks_jsonl": "ingestion/chunks.jsonl",
+    "nodes_jsonl": "graph/nodes.jsonl",
+    "edges_jsonl": "graph/edges.jsonl"
+  },
+  "statistics": {
+    "structured_records": 5,
+    "chunks": 3,
+    "videos": 1,
+    "graph_nodes": 5,
+    "graph_edges": 4,
+    "frames": 1,
+    "document_video_links": 2
+  },
+  "source": {
+    "document": "document.docx",
+    "sha256": "abc123fixturesha"
+  },
+  "build": {
+    "created_at": "2026-01-01T00:00:00Z"
+  },
+  "extra_build_field": "retained"
+}

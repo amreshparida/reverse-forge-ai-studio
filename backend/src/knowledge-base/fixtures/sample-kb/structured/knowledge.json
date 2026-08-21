@@ -1,0 +1,159 @@
+[
+  {
+    "id": "sec-1",
+    "source_type": "document",
+    "content_type": "document_section",
+    "title": "Admissions Overview",
+    "text": "Admissions require transcripts and a personal statement.",
+    "content_hash": "h1",
+    "source_file": "document.docx",
+    "source_path": "exports/document.docx",
+    "heading_path": [
+      "Admissions"
+    ],
+    "document_section_id": "sec-1",
+    "video_id": null,
+    "bundle_name": null,
+    "video_refs": [
+      "vid-orientation"
+    ],
+    "images": [
+      "assets/document-images/fig1.png"
+    ],
+    "frames": [],
+    "entities": [
+      "ent-registrar"
+    ],
+    "concepts": [
+      "con-admission"
+    ],
+    "topics": [
+      "top-admissions"
+    ],
+    "provenance": [
+      {
+        "kind": "docx",
+        "path": "exports/document.docx",
+        "page": 1
+      }
+    ],
+    "metadata": {
+      "page": 1
+    },
+    "custom_field": "keep-me"
+  },
+  {
+    "id": "vid-orientation",
+    "source_type": "video",
+    "content_type": "video",
+    "title": "Orientation Video",
+    "text": "Welcome orientation covering campus life and registration.",
+    "content_hash": "h2",
+    "source_file": "videos/orientation.mp4",
+    "heading_path": [
+      "Orientation"
+    ],
+    "video_id": "vid-orientation",
+    "bundle_name": "orientation-bundle",
+    "video_refs": [],
+    "images": [],
+    "frames": [
+      "assets/video-frames/v1-f1.png"
+    ],
+    "entities": [
+      "ent-registrar"
+    ],
+    "concepts": [
+      "con-admission"
+    ],
+    "topics": [
+      "top-admissions"
+    ],
+    "provenance": [
+      {
+        "kind": "video",
+        "video_id": "vid-orientation"
+      }
+    ],
+    "metadata": {
+      "duration_s": 120
+    }
+  },
+  {
+    "id": "top-admissions",
+    "source_type": "topic",
+    "content_type": "topic",
+    "title": "Admissions",
+    "text": "Topic covering university admissions.",
+    "content_hash": "h3",
+    "source_file": "topics/admissions.md",
+    "heading_path": [
+      "Topics",
+      "Admissions"
+    ],
+    "video_refs": [],
+    "images": [],
+    "frames": [],
+    "entities": [],
+    "concepts": [
+      "con-admission"
+    ],
+    "topics": [
+      "top-admissions"
+    ],
+    "provenance": [],
+    "metadata": {}
+  },
+  {
+    "id": "con-admission",
+    "source_type": "concept",
+    "content_type": "concept",
+    "title": "Admission Concept",
+    "text": "The concept of formal admission to the university.",
+    "content_hash": "h4",
+    "source_file": "concepts/admission.md",
+    "heading_path": [
+      "Concepts",
+      "Admission"
+    ],
+    "video_refs": [],
+    "images": [],
+    "frames": [],
+    "entities": [
+      "ent-registrar"
+    ],
+    "concepts": [
+      "con-admission"
+    ],
+    "topics": [
+      "top-admissions"
+    ],
+    "provenance": [],
+    "metadata": {}
+  },
+  {
+    "id": "ent-registrar",
+    "source_type": "entity",
+    "content_type": "entity",
+    "title": "Registrar",
+    "text": "University registrar office.",
+    "content_hash": "h5",
+    "source_file": "entities/registrar.md",
+    "heading_path": [
+      "Entities",
+      "Registrar"
+    ],
+    "video_refs": [],
+    "images": [],
+    "frames": [],
+    "entities": [
+      "ent-registrar"
+    ],
+    "concepts": [],
+    "topics": [
+      "top-admissions"
+    ],
+    "provenance": [],
+    "metadata": {}
+  }
+]

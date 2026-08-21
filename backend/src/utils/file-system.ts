@@ -45,6 +45,14 @@ export function getReportsDir(projectSlug: string, sessionId: string): string {
   return ensureDir(path.join(config.outputDir, projectSlug, sessionId, 'reports'));
 }
 
+export function getUploadedEvidenceDir(projectSlug: string, sessionId: string): string {
+  return ensureDir(path.join(config.outputDir, projectSlug, sessionId, 'uploaded-evidence'));
+}
+
+export function getKnowledgeBaseDir(projectSlug: string, sessionId: string): string {
+  return ensureDir(path.join(config.outputDir, projectSlug, sessionId, 'knowledge-base'));
+}
+
 export function getSessionStorageDir(projectSlug: string): string {
   return ensureDir(path.join(config.sessionDir, projectSlug));
 }

@@ -44,6 +44,15 @@ export class SharedCrawlState extends EventEmitter {
   readonly urlQueue: QueueEntry[] = [];
   readonly visitedUrls = new Set<string>();
   readonly inProgressUrls = new Set<string>();
+  /** Pages BFS flagged for LLM deep-pass while still in-progress */
+  private readonly pendingDeep = new Set<string>();
+  private readonly pendingDeepDepth = new Map<string, number>();
+  private readonly deepCompleted = new Set<string>();
+  /** URLs the LLM agent has finished exploring (may overlap BFS visited). */
+  private readonly llmExplored = new Set<string>();
+  private readonly llmInProgress = new Set<string>();
+  /** Post-login start URL reserved for the LLM window (BFS may claim the same URL separately). */
+  private llmSeedUrl: string | null = null;
 
   // ── Knowledge base ────────────────────────────────────────────────────
   readonly pageKnowledge = new Map<string, PageKnowledge>();
@@ -76,8 +85,13 @@ export class SharedCrawlState extends EventEmitter {
     private readonly excludedUrls: string[],
   ) {
     super();
-    // Seed the queue with the base URL
-    this.urlQueue.push({ url: baseUrl, depth: 0, needsDeep: false, addedBy: 'system' });
+    this.llmSeedUrl = this.normalizeUrl(baseUrl);
+    this.urlQueue.push({
+      url: this.llmSeedUrl,
+      depth: 0,
+      needsDeep: false,
+      addedBy: 'system',
+    });
   }
 
   /** Stop both agents ASAP — clears queue and marks agents done. */
@@ -86,64 +100,157 @@ export class SharedCrawlState extends EventEmitter {
     this.aborted = true;
     this.abortReason = reason;
     this.urlQueue.length = 0;
+    this.pendingDeep.clear();
+    this.pendingDeepDepth.clear();
+    this.llmInProgress.clear();
     this.bfsDone = true;
     this.llmDone = true;
     this.emit('aborted', reason);
     logger.warn(`[SharedState] Crawl aborted: ${reason}`);
   }
 
+  /** Replace queue after login with the real post-login URL (normalized). */
+  reseed(startUrl: string): void {
+    this.urlQueue.length = 0;
+    this.visitedUrls.clear();
+    this.inProgressUrls.clear();
+    this.pendingDeep.clear();
+    this.pendingDeepDepth.clear();
+    this.deepCompleted.clear();
+    this.llmExplored.clear();
+    this.llmInProgress.clear();
+    const norm = this.normalizeUrl(startUrl);
+    this.llmSeedUrl = norm;
+    this.urlQueue.push({
+      url: norm,
+      depth: 0,
+      needsDeep: false,
+      addedBy: 'system',
+    });
+  }
+
   // ── URL Queue operations (atomic — no await between check and splice) ─
 
   /**
-   * BFS agent prefers non-deep URLs.
-   * LLM agent prefers deep URLs; falls back to any URL if no deep ones exist.
+   * BFS and LLM run in separate Chromium windows — they may explore the same
+   * start URL in parallel. LLM also re-visits BFS shell captures to open menus.
    */
   claimUrl(agentType: 'bfs' | 'llm'): QueueEntry | null {
     if (this.aborted) return null;
+    const free = (u: QueueEntry) => !this.inProgressUrls.has(this.normalizeUrl(u.url));
+
     if (agentType === 'llm') {
-      // Prefer deep-explore pages
-      const deepIdx = this.urlQueue.findIndex(
-        (u) => u.needsDeep && !this.inProgressUrls.has(u.url),
-      );
+      // Deep pages first, then URLs the LLM itself discovered.
+      // Do NOT drain BFS's shell queue (addedBy bfs/system) — that left BFS at 1 page.
+      const deepIdx = this.urlQueue.findIndex((u) => u.needsDeep && free(u) && !this.llmExplored.has(this.normalizeUrl(u.url)));
       if (deepIdx !== -1) {
         const item = this.urlQueue.splice(deepIdx, 1)[0]!;
-        this.inProgressUrls.add(item.url);
+        const norm = this.normalizeUrl(item.url);
+        this.inProgressUrls.add(norm);
+        this.llmInProgress.add(norm);
         return item;
       }
-      // Fall back to any available URL when deep queue is empty
-      const anyIdx = this.urlQueue.findIndex((u) => !this.inProgressUrls.has(u.url));
-      if (anyIdx !== -1) {
-        const item = this.urlQueue.splice(anyIdx, 1)[0]!;
-        this.inProgressUrls.add(item.url);
+      const ownIdx = this.urlQueue.findIndex(
+        (u) => u.addedBy === 'llm' && free(u) && !this.llmExplored.has(this.normalizeUrl(u.url)),
+      );
+      if (ownIdx !== -1) {
+        const item = this.urlQueue.splice(ownIdx, 1)[0]!;
+        const norm = this.normalizeUrl(item.url);
+        this.inProgressUrls.add(norm);
+        this.llmInProgress.add(norm);
         return item;
+      }
+      // Only take BFS leftovers after BFS has finished discovering
+      if (this.bfsDone) {
+        const anyIdx = this.urlQueue.findIndex(
+          (u) => free(u) && !this.llmExplored.has(this.normalizeUrl(u.url)),
+        );
+        if (anyIdx !== -1) {
+          const item = this.urlQueue.splice(anyIdx, 1)[0]!;
+          const norm = this.normalizeUrl(item.url);
+          this.inProgressUrls.add(norm);
+          this.llmInProgress.add(norm);
+          return item;
+        }
+      }
+
+      // Dedicated seed: explore post-login URL in the LLM window even if BFS already claimed it
+      if (
+        this.llmSeedUrl &&
+        !this.llmExplored.has(this.llmSeedUrl) &&
+        !this.llmInProgress.has(this.llmSeedUrl)
+      ) {
+        this.llmInProgress.add(this.llmSeedUrl);
+        // needsDeep=false → multi-step navigator (menus). true would only run tab deepExplore.
+        return { url: this.llmSeedUrl, depth: 0, needsDeep: false, addedBy: 'system' };
+      }
+
+      // Re-visit BFS shell pages for menu/interaction discovery (separate window — safe)
+      for (const [norm, knowledge] of this.pageKnowledge) {
+        if (knowledge.capturedBy !== 'bfs') continue;
+        if (this.llmExplored.has(norm) || this.llmInProgress.has(norm)) continue;
+        this.llmInProgress.add(norm);
+        return { url: norm, depth: 1, needsDeep: false, addedBy: 'bfs' };
       }
     } else {
-      // BFS prefers regular (non-deep) URLs
-      const regularIdx = this.urlQueue.findIndex(
-        (u) => !u.needsDeep && !this.inProgressUrls.has(u.url),
-      );
-      if (regularIdx !== -1) {
-        const item = this.urlQueue.splice(regularIdx, 1)[0]!;
-        this.inProgressUrls.add(item.url);
-        return item;
-      }
-      // Fall back to deep URLs if no regular ones
-      const anyIdx = this.urlQueue.findIndex((u) => !this.inProgressUrls.has(u.url));
-      if (anyIdx !== -1) {
-        const item = this.urlQueue.splice(anyIdx, 1)[0]!;
-        this.inProgressUrls.add(item.url);
+      // BFS: shell-capture any non-deep URL, including ones the LLM discovered.
+      // (Previously we skipped addedBy==='llm' until llmDone — that left BFS stuck at 1
+      // page while the queue filled with Import/Configure routes the LLM had found.)
+      const bfsIdx = this.urlQueue.findIndex((u) => !u.needsDeep && free(u));
+      if (bfsIdx !== -1) {
+        const item = this.urlQueue.splice(bfsIdx, 1)[0]!;
+        this.inProgressUrls.add(this.normalizeUrl(item.url));
         return item;
       }
     }
     return null;
   }
 
-  releaseUrl(url: string, success: boolean): void {
-    this.inProgressUrls.delete(url);
-    if (success) {
-      this.visitedUrls.add(url);
+  releaseUrl(url: string, success: boolean, agent: 'bfs' | 'llm' = 'bfs'): void {
+    const norm = this.normalizeUrl(url);
+    if (agent === 'llm') {
+      this.llmInProgress.delete(norm);
+      // Seed/follow-up claims are not always in the shared in-progress set
+      this.inProgressUrls.delete(norm);
+      if (success) {
+        this.llmExplored.add(norm);
+        this.visitedUrls.add(norm);
+      }
+      this.emit('url-released');
+      return;
     }
+    this.inProgressUrls.delete(norm);
+    if (success) {
+      this.visitedUrls.add(norm);
+    }
+    this.flushPendingDeep(norm);
     this.emit('url-released');
+  }
+
+  /** True when LLM still has seed or BFS-shell pages to explore. */
+  hasPendingLlmWork(): boolean {
+    if (
+      this.llmSeedUrl &&
+      !this.llmExplored.has(this.llmSeedUrl) &&
+      !this.llmInProgress.has(this.llmSeedUrl)
+    ) {
+      return true;
+    }
+    for (const [norm, knowledge] of this.pageKnowledge) {
+      if (
+        knowledge.capturedBy === 'bfs' &&
+        !this.llmExplored.has(norm) &&
+        !this.llmInProgress.has(norm)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  markDeepCompleted(url: string): void {
+    this.deepCompleted.add(this.normalizeUrl(url));
+    this.stats.deepExploreHandled++;
   }
 
   /**
@@ -154,7 +261,7 @@ export class SharedCrawlState extends EventEmitter {
     if (
       this.visitedUrls.has(norm) ||
       this.inProgressUrls.has(norm) ||
-      this.urlQueue.some((u) => u.url === norm) ||
+      this.urlQueue.some((u) => this.normalizeUrl(u.url) === norm) ||
       !this.isUrlAllowed(norm) ||
       depth > this.maxDepth
     ) {
@@ -171,19 +278,45 @@ export class SharedCrawlState extends EventEmitter {
   }
 
   /**
-   * Mark a URL as needing deep LLM exploration (has tabs, accordions, etc.)
+   * Mark a URL as needing deep LLM exploration (has real tabs, etc.)
    */
   flagForDeepExplore(url: string, depth: number): void {
     const norm = this.normalizeUrl(url);
-    if (this.visitedUrls.has(norm) || this.inProgressUrls.has(norm)) return;
-    // If already in queue, upgrade it
-    const existing = this.urlQueue.find((u) => u.url === norm);
+    if (this.deepCompleted.has(norm)) return;
+
+    const existing = this.urlQueue.find((u) => this.normalizeUrl(u.url) === norm);
     if (existing) {
       existing.needsDeep = true;
-    } else {
-      this.addUrl(norm, depth, true, 'bfs');
+      this.emit('deep-flagged', norm);
+      return;
     }
+    if (this.inProgressUrls.has(norm)) {
+      this.pendingDeep.add(norm);
+      this.pendingDeepDepth.set(norm, depth);
+      this.emit('deep-flagged', norm);
+      return;
+    }
+    // Shell already visited — still allow a deep-only LLM pass
+    if (this.visitedUrls.has(norm)) {
+      this.urlQueue.push({ url: norm, depth, needsDeep: true, addedBy: 'bfs' });
+      this.emit('deep-flagged', norm);
+      return;
+    }
+    this.addUrl(norm, depth, true, 'bfs');
     this.emit('deep-flagged', norm);
+  }
+
+  /** After BFS releases a page, enqueue any pending deep LLM pass. */
+  flushPendingDeep(url: string): void {
+    const norm = this.normalizeUrl(url);
+    if (!this.pendingDeep.has(norm) || this.deepCompleted.has(norm)) return;
+    this.pendingDeep.delete(norm);
+    const depth = this.pendingDeepDepth.get(norm) ?? 0;
+    this.pendingDeepDepth.delete(norm);
+    if (this.urlQueue.some((u) => this.normalizeUrl(u.url) === norm && u.needsDeep)) return;
+    if (this.inProgressUrls.has(norm)) return;
+    this.urlQueue.push({ url: norm, depth, needsDeep: true, addedBy: 'bfs' });
+    logger.debug(`[SharedState] Queued pending deep explore: ${norm}`);
   }
 
   // ── Knowledge base operations ─────────────────────────────────────────
@@ -201,7 +334,6 @@ export class SharedCrawlState extends EventEmitter {
     if (knowledge.capturedBy === 'bfs') this.stats.bfsPages++;
     else {
       this.stats.llmPages++;
-      if (knowledge.tabCount > 0) this.stats.deepExploreHandled++;
     }
 
     logger.debug(
@@ -219,6 +351,7 @@ export class SharedCrawlState extends EventEmitter {
     return (
       this.urlQueue.length === 0 &&
       this.inProgressUrls.size === 0 &&
+      this.pendingDeep.size === 0 &&
       (this.bfsDone || this.llmDone)
     );
   }
@@ -238,11 +371,24 @@ export class SharedCrawlState extends EventEmitter {
 
   // ── Helpers ───────────────────────────────────────────────────────────
 
-  private normalizeUrl(url: string): string {
+  /**
+   * Normalize for dedupe while KEEPING SPA hash routes (#/Module/...).
+   * Stripping the hash was collapsing Essential Cloud (and similar) into one URL
+   * and emptying the collab queue after a handful of real /path links.
+   */
+  normalizeUrl(url: string): string {
     try {
       const parsed = new URL(url);
       const p = parsed.pathname.replace(/\/$/, '') || '/';
-      return `${parsed.protocol}//${parsed.hostname}${parsed.port ? ':' + parsed.port : ''}${p}${parsed.search}`;
+      let result = `${parsed.protocol}//${parsed.hostname}${parsed.port ? ':' + parsed.port : ''}${p}`;
+      if (parsed.search) result += parsed.search;
+      const hash = parsed.hash || '';
+      if (hash && hash !== '#' && hash.length > 1) {
+        // Keep #/route — drop trailing slash inside hash path
+        const cleaned = hash.replace(/\/$/, '') || hash;
+        result += cleaned;
+      }
+      return result;
     } catch {
       return url;
     }
@@ -251,7 +397,6 @@ export class SharedCrawlState extends EventEmitter {
   private isUrlAllowed(url: string): boolean {
     try {
       if (isSessionEndingUrl(url)) return false;
-      // Reuse the same domain/excluded/unsafe checks as standalone BFS
       return isUrlSafe(url, this.allowedDomains, this.excludedUrls);
     } catch {
       return false;
