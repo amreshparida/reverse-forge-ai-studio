@@ -2,12 +2,17 @@ import fs from 'fs';
 import path from 'path';
 import { prisma } from '../database/client';
 import { config } from '../config';
-import { createLLMClient, isLLMConfigured, type LLMConfig, type LLMMessage } from '../ai/llm';
+import {
+  createLLMClient,
+  isLLMConfigured,
+  resolveAnalysisLlmConfig,
+  type LLMConfig,
+  type LLMMessage,
+} from '../ai/llm';
 import { buildImageOcrPrompt } from '../ai/prompts';
 import { KnowledgeBaseRepository } from '../knowledge-base';
 import { getAnalysisDir, getKnowledgeBaseDir, getUploadedEvidenceDir, writeJson } from '../utils/file-system';
 import { logger } from '../utils/logger';
-import { sleep } from '../utils/retry';
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
 
@@ -205,7 +210,8 @@ export async function analyzeEvidenceImages(args: {
   sessionId: string;
   llmConfig?: LLMConfig;
 }): Promise<{ analyzed: number; skipped: number; results: ImageOcrResult[] }> {
-  if (!isLLMConfigured(args.llmConfig)) {
+  const analysisLlmConfig = resolveAnalysisLlmConfig(args.llmConfig);
+  if (!isLLMConfigured(analysisLlmConfig)) {
     logger.warn('[ImageOCR] LLM not configured — skipping image OCR for evidence');
     return { analyzed: 0, skipped: 0, results: loadStoredImageOcr(args.projectSlug, args.sessionId) };
   }
@@ -219,17 +225,32 @@ export async function analyzeEvidenceImages(args: {
   let analyzed = 0;
   let skipped = 0;
 
-  logger.info(`[ImageOCR] Analyzing ${candidates.length} evidence image(s) for session ${args.sessionId}`);
-
-  for (const candidate of candidates) {
-    if (existingByPath.has(candidate.relativePath)) {
+  const pending = candidates.filter((c) => {
+    if (existingByPath.has(c.relativePath)) {
       skipped += 1;
-      continue;
+      return false;
     }
+    return true;
+  });
+  const concurrency = Math.min(config.llm.analysisConcurrency, Math.max(1, pending.length));
 
+  logger.info(
+    `[ImageOCR] Analyzing ${pending.length} evidence image(s) (${skipped} cached) for session ${args.sessionId} model=${analysisLlmConfig.model} concurrency=${concurrency}`,
+  );
+
+  const persistResults = () => {
+    writeJson(path.join(analysisDir, 'image-ocr-results.json'), {
+      sessionId: args.sessionId,
+      analyzedAt: new Date().toISOString(),
+      totalImages: results.length,
+      results,
+    });
+  };
+
+  const processCandidate = async (candidate: ImageCandidate): Promise<void> => {
     try {
-      const ocr = await runVisionOcr(args.llmConfig, candidate);
-      if (!ocr) continue;
+      const ocr = await runVisionOcr(analysisLlmConfig, candidate);
+      if (!ocr) return;
 
       const result: ImageOcrResult = {
         relativePath: candidate.relativePath,
@@ -280,20 +301,27 @@ export async function analyzeEvidenceImages(args: {
         }
       }
 
-      await sleep(800);
+      if (analyzed % concurrency === 0) {
+        persistResults();
+        logger.info(`[ImageOCR] Progress ${analyzed}/${pending.length} for session ${args.sessionId}`);
+      }
     } catch (err) {
       logger.warn(
         `[ImageOCR] Failed for ${candidate.relativePath}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-  }
+  };
 
-  writeJson(path.join(analysisDir, 'image-ocr-results.json'), {
-    sessionId: args.sessionId,
-    analyzedAt: new Date().toISOString(),
-    totalImages: results.length,
-    results,
+  let nextIndex = 0;
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (true) {
+      const i = nextIndex++;
+      if (i >= pending.length) break;
+      await processCandidate(pending[i]!);
+    }
   });
+  await Promise.all(workers);
+  persistResults();
 
   return { analyzed, skipped, results };
 }

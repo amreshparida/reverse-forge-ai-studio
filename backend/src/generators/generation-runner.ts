@@ -1,5 +1,6 @@
 import { analyzeSession } from '../ai/analyzer';
 import { analyzeEvidenceImages } from '../evidence/image-analysis';
+import { resolveAnalysisLlmConfig } from '../ai/llm';
 import { inferEntities, type EntityModel } from '../inference/entity';
 import { inferWorkflows, type WorkflowModel } from '../inference/workflow';
 import { inferPermissions, type PermissionMatrix } from '../inference/permissions';
@@ -175,9 +176,13 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
     // ── 1. Page analysis ────────────────────────────────────────────────
     if (!isStageCompleted(checkpoint, 'page-analysis')) {
       checkpoint = await beginStage(checkpoint, 'page-analysis', 'Analysis agent: page-by-page AI analysis', args);
+      const analysisLlmConfig = resolveAnalysisLlmConfig(llmConfig);
+      logger.info(
+        `[Generation] Page analysis + OCR using model=${analysisLlmConfig.model} (LLM_MODEL=${llmConfig.model || 'default'} for later stages)`,
+      );
       const failedPages: Array<{ sessionId: string; url: string; error: string }> = [];
       for (const sourceSessionId of sourceSessionIds) {
-        const result = await analyzeSession(sourceSessionId, llmConfig, appName);
+        const result = await analyzeSession(sourceSessionId, analysisLlmConfig, appName, projectSlug);
         failedPages.push(...result.failed.map((failure) => ({
           sessionId: sourceSessionId,
           url: failure.url,
@@ -187,7 +192,7 @@ export async function runReportGeneration(args: RunGenerationArgs): Promise<stri
         const imageOcr = await analyzeEvidenceImages({
           projectSlug,
           sessionId: sourceSessionId,
-          llmConfig,
+          llmConfig: analysisLlmConfig,
         });
         logger.info(
           `[Generation] Image OCR for session ${sourceSessionId}: ${imageOcr.analyzed} analyzed, ${imageOcr.skipped} cached`,

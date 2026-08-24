@@ -1017,8 +1017,17 @@ function buildStructuralKnowledgeGraph(workspace: SynthesisWorkspace): Record<st
     edges.push({ from, to, type });
   };
 
+  const asLabel = (value: unknown): string | null => {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      return trimmed || null;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    return null;
+  };
+
   for (const mod of new Set(
-    workspace.index.map((p) => p.module).filter((m): m is string => Boolean(m && m.trim())),
+    workspace.index.map((p) => asLabel(p.module)).filter((m): m is string => Boolean(m)),
   )) {
     addNode({ id: `module:${mod}`, type: 'module', label: mod, properties: {} });
   }
@@ -1031,28 +1040,31 @@ function buildStructuralKnowledgeGraph(workspace: SynthesisWorkspace): Record<st
       label: ent.name,
       properties: { module: ent.primaryModule ?? null },
     });
-    if (ent.primaryModule) {
-      addNode({ id: `module:${ent.primaryModule}`, type: 'module', label: ent.primaryModule, properties: {} });
-      addEdge(`entity:${ent.name}`, `module:${ent.primaryModule}`, 'belongs_to_module');
+    const primaryModule = asLabel(ent.primaryModule);
+    if (primaryModule) {
+      addNode({ id: `module:${primaryModule}`, type: 'module', label: primaryModule, properties: {} });
+      addEdge(`entity:${ent.name}`, `module:${primaryModule}`, 'belongs_to_module');
     }
   }
 
   for (const page of workspace.index) {
     const pageId = `page:${page.id}`;
+    const pageModule = asLabel(page.module);
+    const pageEntity = asLabel(page.entity);
     addNode({
       id: pageId,
       type: 'page',
       label: page.title ?? page.url,
-      properties: { url: page.url, module: page.module, entity: page.entity },
+      properties: { url: page.url, module: pageModule, entity: pageEntity },
     });
-    if (page.module) {
-      moduleCounts.set(page.module, (moduleCounts.get(page.module) ?? 0) + 1);
-      addNode({ id: `module:${page.module}`, type: 'module', label: page.module, properties: {} });
-      addEdge(pageId, `module:${page.module}`, 'belongs_to_module');
+    if (pageModule) {
+      moduleCounts.set(pageModule, (moduleCounts.get(pageModule) ?? 0) + 1);
+      addNode({ id: `module:${pageModule}`, type: 'module', label: pageModule, properties: {} });
+      addEdge(pageId, `module:${pageModule}`, 'belongs_to_module');
     }
-    if (page.entity) {
-      addNode({ id: `entity:${page.entity}`, type: 'entity', label: page.entity, properties: {} });
-      addEdge(pageId, `entity:${page.entity}`, 'shows_entity');
+    if (pageEntity) {
+      addNode({ id: `entity:${pageEntity}`, type: 'entity', label: pageEntity, properties: {} });
+      addEdge(pageId, `entity:${pageEntity}`, 'shows_entity');
     }
   }
 
@@ -1245,12 +1257,32 @@ function validateArtifactContent(name: string, content: unknown): string | null 
     if (!Array.isArray(obj['findings'])) {
       return `${name} requires findings[]`;
     }
+    const agentHint = name.replace(/-findings\.json$/, '');
     for (const finding of obj['findings'] as Array<Record<string, unknown>>) {
       if (typeof finding['title'] !== 'string' || typeof finding['detail'] !== 'string') {
         return `${name} findings require string title and detail fields`;
       }
       if (!Array.isArray(finding['evidenceNodeIds']) || finding['evidenceNodeIds'].length === 0) {
         return `${name} finding "${String(finding['title'] ?? '?')}" requires at least one evidenceNodeId`;
+      }
+      if (typeof finding['category'] !== 'string' || !finding['category'].trim()) {
+        finding['category'] =
+          agentHint === 'ui-ux-agent'
+            ? 'ux'
+            : agentHint === 'api-integration-agent'
+              ? 'api'
+              : agentHint === 'data-engineer-agent'
+                ? 'data'
+                : agentHint === 'domain-product-agent'
+                  ? 'domain'
+                  : agentHint === 'security-compliance-agent'
+                    ? 'security'
+                    : agentHint === 'solution-architect-agent'
+                      ? 'architecture'
+                      : 'general';
+      }
+      if (typeof finding['agent'] !== 'string' || !finding['agent'].trim()) {
+        finding['agent'] = agentHint;
       }
     }
   }

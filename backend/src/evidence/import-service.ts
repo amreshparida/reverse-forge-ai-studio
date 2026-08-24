@@ -28,6 +28,16 @@ const TEXT_EXTENSIONS = new Set([
   '.pl', '.pm', '.ps1', '.bat', '.cmd', '.dockerfile', '.gitignore', '.npmrc', '.editorconfig',
 ]);
 
+/** Cap text stored per uploaded file — full file remains on disk. */
+const UPLOAD_VISIBLE_TEXT_MAX = 20_000;
+
+/** macOS zip metadata — never import as evidence pages */
+function isAppleDoubleJunk(relPath: string): boolean {
+  const parts = relPath.replace(/\\/g, '/').split('/');
+  if (parts.some((p) => p === '__MACOSX')) return true;
+  const base = parts[parts.length - 1] ?? '';
+  return base.startsWith('._') || base === '.DS_Store';
+}
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp']);
 
 export function extractReadableText(absPath: string, filename: string): string | null {
@@ -226,13 +236,14 @@ function buildUploadedExtractedData(args: {
   contentPreview?: string | null;
 }): Record<string, unknown> {
   const fullText = args.contentPreview ?? '';
+  const previewText = fullText.slice(0, UPLOAD_VISIBLE_TEXT_MAX);
   return {
     url: `upload://${args.relativePath}`,
     title: args.filename,
     pageType: 'unknown',
     headings: [],
-    visibleText: fullText,
-    paragraphs: fullText ? [fullText] : [],
+    visibleText: previewText,
+    paragraphs: previewText ? [previewText] : [],
     breadcrumbs: ['Uploaded Evidence'],
     allClickables: [],
     forms: [],
@@ -262,6 +273,7 @@ function buildUploadedExtractedData(args: {
       treatedAsPrimaryEvidence: true,
       fullTextIncluded: Boolean(fullText),
       characterCount: fullText.length,
+      previewTruncated: fullText.length > UPLOAD_VISIBLE_TEXT_MAX,
     },
   };
 }
@@ -295,7 +307,9 @@ async function createPageFromUploadedFile(args: {
       url: `upload://${args.relativePath.replace(/\\/g, '/')}`,
       title: filename,
       depth: 0,
-      visibleText: contentPreview ?? `[Uploaded binary file: ${filename}, ${stat.size} bytes — original preserved on disk for analysis/OCR]`,
+      visibleText: contentPreview
+        ? contentPreview.slice(0, UPLOAD_VISIBLE_TEXT_MAX)
+        : `[Uploaded binary file: ${filename}, ${stat.size} bytes — original preserved on disk for analysis/OCR]`,
       extractedData: JSON.stringify(extractedData),
       screenshotPath,
       fullScreenshotPath: screenshotPath,
@@ -498,6 +512,7 @@ async function indexUploadedEvidenceDir(args: {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
       const abs = path.join(dir, entry.name);
+      if (isAppleDoubleJunk(rel)) continue;
       if (entry.isDirectory()) {
         await walk(abs, rel);
         continue;
@@ -533,6 +548,7 @@ function writeUploadedStructureInventory(projectSlug: string, sessionId: string)
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
       const abs = path.join(dir, entry.name);
+      if (isAppleDoubleJunk(rel)) continue;
       if (entry.isDirectory()) {
         walk(abs, rel);
         continue;
@@ -565,6 +581,7 @@ function extractZipSafely(zipPath: string, destDir: string): number {
   for (const entry of entries) {
     if (entry.isDirectory) continue;
     const entryName = entry.entryName.replace(/\\/g, '/');
+    if (isAppleDoubleJunk(entryName)) continue;
     if (entryName.includes('..') || path.isAbsolute(entryName)) {
       throw new Error(`Unsafe zip entry path: ${entryName}`);
     }
@@ -768,6 +785,7 @@ export function loadUploadedEvidenceForAnalysis(
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
           const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
           const abs = path.join(dir, entry.name);
+          if (isAppleDoubleJunk(rel)) continue;
           if (entry.isDirectory()) {
             walk(abs, rel);
             continue;

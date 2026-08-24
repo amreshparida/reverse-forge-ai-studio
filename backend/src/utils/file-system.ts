@@ -57,14 +57,34 @@ export function getSessionStorageDir(projectSlug: string): string {
   return ensureDir(path.join(config.sessionDir, projectSlug));
 }
 
-export function urlToFilename(url: string, ext = '.html'): string {
-  const parsed = new URL(url);
-  const pathPart = parsed.pathname
+function sanitizeFilenamePart(raw: string, maxLen = 100): string {
+  return raw
     .replace(/^\//, '')
     .replace(/\//g, '__')
     .replace(/[^a-zA-Z0-9_\-\.]/g, '_')
-    .substring(0, 100);
-  return (pathPart || 'index') + ext;
+    .replace(/_+/g, '_')
+    .substring(0, maxLen) || 'index';
+}
+
+export function urlToFilename(url: string, ext = '.html'): string {
+  if (!url || typeof url !== 'string') return `unknown${ext}`;
+
+  try {
+    const parsed = new URL(url);
+    // upload://host/path and kb://id — host carries the first path segment
+    const pathPart =
+      parsed.protocol === 'upload:' || parsed.protocol === 'kb:'
+        ? [parsed.host, parsed.pathname.replace(/^\//, ''), parsed.hash.replace(/^#/, '')]
+            .filter(Boolean)
+            .join('__')
+        : parsed.pathname;
+    return sanitizeFilenamePart(pathPart) + ext;
+  } catch {
+    const fallback = url
+      .replace(/^[^:]+:\/\//, '')
+      .replace(/[#?].*$/, '');
+    return sanitizeFilenamePart(fallback || url) + ext;
+  }
 }
 
 export function writeJson(filePath: string, data: unknown): void {

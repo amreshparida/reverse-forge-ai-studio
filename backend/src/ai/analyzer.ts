@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { prisma } from '../database/client';
 import { config } from '../config';
-import { createLLMClient, isLLMConfigured, type LLMConfig, type LLMMessage } from './llm';
+import { createLLMClient, isLLMConfigured, resolveAnalysisLlmConfig, type LLMConfig, type LLMMessage } from './llm';
 import {
   buildPageAnalysisPrompt,
   buildVisualAnalysisPrompt,
@@ -13,6 +13,7 @@ import { logger } from '../utils/logger';
 import { sleep, withRetry, isNetworkError, retryUntilSuccess } from '../utils/retry';
 import { writeJson } from '../utils/file-system';
 import type { PageExtractedData } from '../extractor';
+import { analyzeBulkEvidenceFile, isBulkEvidenceUpload } from '../evidence/bulk-evidence-analyzer';
 
 export interface PageAnalysisResult {
   businessModule: string;
@@ -51,10 +52,27 @@ export interface SessionAnalysisSummary {
   failed: Array<{ pageId: string; url: string; error: string }>;
 }
 
+/** Max visible text sent to the page-analysis LLM (avoids timeouts on multi-MB uploads). */
+const ANALYSIS_VISIBLE_TEXT_MAX = 24_000;
+
+function isMetadataStubAnalysis(aiAnalysis: string | null | undefined): boolean {
+  if (!aiAnalysis) return false;
+  try {
+    const parsed = JSON.parse(aiAnalysis) as { primaryEntity?: string; pagePurpose?: string };
+    return (
+      parsed.primaryEntity === 'BulkDataFile' ||
+      (parsed.pagePurpose?.includes('metadata-only stub') ?? false)
+    );
+  } catch {
+    return false;
+  }
+}
+
 export async function analyzeSession(
   sessionId: string,
   llmConfig?: LLMConfig,
   appName?: string,
+  projectSlug?: string,
 ): Promise<SessionAnalysisSummary> {
   const summary: SessionAnalysisSummary = {
     sessionId,
@@ -65,48 +83,95 @@ export async function analyzeSession(
     invalidExtractedData: 0,
     failed: [],
   };
-  if (!isLLMConfigured(llmConfig)) {
+  const analysisLlmConfig = resolveAnalysisLlmConfig(llmConfig);
+  if (!isLLMConfigured(analysisLlmConfig)) {
     logger.warn('LLM not configured, skipping AI analysis');
     return summary;
   }
 
-  const llm = createLLMClient(llmConfig);
+  const llm = createLLMClient(analysisLlmConfig);
+  let resolvedProjectSlug = projectSlug;
+  if (!resolvedProjectSlug) {
+    const session = await prisma.crawlSession.findUnique({
+      where: { id: sessionId },
+      include: { project: { select: { slug: true } } },
+    });
+    resolvedProjectSlug = session?.project.slug;
+  }
   const pages = await prisma.pageCapture.findMany({
     where: { crawlSessionId: sessionId },
     orderBy: { createdAt: 'asc' },
   });
   summary.totalPages = pages.length;
-  summary.alreadyAnalyzed = pages.filter((page) => Boolean(page.aiAnalysis)).length;
+  summary.alreadyAnalyzed = pages.filter(
+    (page) => Boolean(page.aiAnalysis) && !isMetadataStubAnalysis(page.aiAnalysis),
+  ).length;
 
   type QueueItem = (typeof pages)[number];
   const queue: QueueItem[] = pages.filter((page) => {
-    if (page.aiAnalysis) {
+    if (page.aiAnalysis && !isMetadataStubAnalysis(page.aiAnalysis)) {
       logger.debug(`Skipping already-analyzed page: ${page.url}`);
       return false;
     }
     if (!page.extractedData) return false;
+    // macOS zip junk (also deleted from DB; skip if any remain in-memory mid-run)
+    if (page.url.includes('__MACOSX') || /\/\._[^/]+$/.test(page.url)) return false;
     return true;
   });
   summary.eligiblePages = queue.length;
   const queueAttempts = new Map<string, number>();
   const maxQueueAttempts = 2;
+  const concurrency = Math.min(config.llm.analysisConcurrency, Math.max(1, queue.length));
 
-  logger.info(`Analyzing ${queue.length} pages with AI (${pages.length} total)`);
+  logger.info(
+    `Analyzing ${queue.length} pages with AI (${pages.length} total) model=${analysisLlmConfig.model} concurrency=${concurrency}`,
+  );
 
-  while (queue.length > 0) {
-    const page = queue.shift()!;
+  function truncateForAnalysis(text: string, max = ANALYSIS_VISIBLE_TEXT_MAX): string {
+    if (text.length <= max) return text;
+    return `${text.slice(0, max)}\n\n[... truncated ${text.length - max} characters for LLM analysis ...]`;
+  }
+
+  const processPage = async (page: QueueItem): Promise<void> => {
     let extractedData: PageExtractedData | null = null;
     try {
       extractedData = JSON.parse(page.extractedData!) as PageExtractedData;
     } catch {
       logger.warn(`Skipping page with invalid extractedData: ${page.url}`);
       summary.invalidExtractedData += 1;
-      continue;
+      return;
+    }
+
+    if (isBulkEvidenceUpload(page)) {
+      if (!resolvedProjectSlug) {
+        summary.failed.push({ pageId: page.id, url: page.url, error: 'Missing project slug for bulk evidence analysis' });
+        return;
+      }
+      try {
+        const analysis = await analyzeBulkEvidenceFile({
+          projectSlug: resolvedProjectSlug,
+          sessionId,
+          page,
+          llm,
+          appName,
+        });
+        await prisma.pageCapture.update({
+          where: { id: page.id },
+          data: { aiAnalysis: JSON.stringify(analysis) },
+        });
+        logger.info(`AI analyzed (bulk/full): ${page.url} -> ${analysis.businessModule}/${analysis.primaryEntity}`);
+        summary.analyzed += 1;
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        logger.error(`Bulk evidence analysis failed for ${page.url}`, { error: errMsg });
+        summary.failed.push({ pageId: page.id, url: page.url, error: errMsg });
+      }
+      return;
     }
 
     const prompt = buildPageAnalysisPrompt(
       extractedData,
-      page.visibleText ?? '',
+      truncateForAnalysis(page.visibleText ?? ''),
       appName,
     );
 
@@ -137,7 +202,6 @@ export async function analyzeSession(
 
       logger.info(`AI analyzed: ${page.url} -> ${analysis.businessModule}/${analysis.primaryEntity}`);
       summary.analyzed += 1;
-      await sleep(1200);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
 
@@ -150,15 +214,24 @@ export async function analyzeSession(
             `AI analysis exhausted retries for ${page.url} — re-queued (${attempts}/${maxQueueAttempts}, queue=${queue.length})`,
             { error: errMsg },
           );
-          await sleep(3000);
-          continue;
+          await sleep(1500);
+          return;
         }
       }
 
       logger.error(`AI analysis failed for page ${page.url}`, { error: errMsg });
       summary.failed.push({ pageId: page.id, url: page.url, error: errMsg });
     }
-  }
+  };
+
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (true) {
+      const page = queue.shift();
+      if (!page) break;
+      await processPage(page);
+    }
+  });
+  await Promise.all(workers);
 
   logger.info(
     `AI analysis summary for ${sessionId}: analyzed=${summary.analyzed}, existing=${summary.alreadyAnalyzed}, failed=${summary.failed.length}, invalid=${summary.invalidExtractedData}`,
@@ -224,9 +297,10 @@ export async function analyzeSessionVisually(
   llmConfig?: LLMConfig,
   outputDir?: string,
 ): Promise<void> {
-  if (!isLLMConfigured(llmConfig)) return;
+  const analysisLlmConfig = resolveAnalysisLlmConfig(llmConfig);
+  if (!isLLMConfigured(analysisLlmConfig)) return;
 
-  const llm = createLLMClient(llmConfig);
+  const llm = createLLMClient(analysisLlmConfig);
   const pages = await prisma.pageCapture.findMany({
     where: { crawlSessionId: sessionId, screenshotPath: { not: null } },
     select: { id: true, title: true, url: true, screenshotPath: true },

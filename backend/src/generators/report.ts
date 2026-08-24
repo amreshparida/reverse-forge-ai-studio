@@ -9,7 +9,8 @@ import { runDeepResearch, type DeepResearchReport } from '../ai/deep-research';
 import { type HarIntelligenceBriefing } from '../ai/har-intelligence';
 import { createLLMClient, isLLMConfigured, resolveSynthesisLlmConfig } from '../ai/llm';
 import { buildExpertReportAnalysisPrompt } from '../ai/prompts';
-import { buildAnalysisGraph, finalizeAnalysisGraphArtifacts, getAnalysisGraphSnapshot, runSpecialistGraphAgents } from '../analysis/graph';
+import { config } from '../config';
+import { buildAnalysisGraph, getAnalysisGraphCounts, finalizeAnalysisGraphArtifacts, runSpecialistGraphAgents } from '../analysis/graph';
 import { logger } from '../utils/logger';
 import { retryUntilSuccess } from '../utils/retry';
 import type { EntityModel, Entity } from '../inference/entity';
@@ -355,7 +356,7 @@ async function runExpertReportAnalysis(
   reportsDir: string,
   onChunkProgress?: (fraction: number, message?: string) => Promise<void> | void,
 ): Promise<ExpertReportAnalysis | null> {
-  // Expert is a synthesis stage — use SYNTHESIS_LLM_* (NVIDIA) when configured, not page-analysis OpenAI.
+  // Expert uses SYNTHESIS_LLM_* again (NVIDIA).
   const expertLlmConfig = resolveSynthesisLlmConfig(ctx.llmConfig);
   if (!expertLlmConfig.apiKey && !isLLMConfigured(ctx.llmConfig)) return null;
 
@@ -418,20 +419,40 @@ async function runExpertReportAnalysis(
     logger.info(
       `Expert report agent using model=${expertLlmConfig.model ?? 'default'} baseUrl=${expertLlmConfig.baseUrl ?? 'default (OpenAI)'}`,
     );
-    const chunkAnalyses: ExpertReportAnalysis[] = [];
+
+    const chunkAnalyses: (ExpertReportAnalysis | null)[] = new Array(chunks.length).fill(null);
+    const pendingIndices: number[] = [];
+    let cachedCount = 0;
 
     for (let i = 0; i < chunks.length; i++) {
       const chunkPath = path.join(reportsDir, `expert-analysis-chunk-${String(i + 1).padStart(3, '0')}.json`);
       const existingChunk = fileExists(chunkPath) ? readJson<ExpertReportAnalysis>(chunkPath) : null;
       if (existingChunk) {
         logger.info(`Reusing expert chunk ${i + 1}/${chunks.length} from checkpoint`);
-        chunkAnalyses.push(existingChunk);
-        await onChunkProgress?.((i + 1) / chunks.length, `Expert analysis chunk ${i + 1}/${chunks.length} (cached)`);
-        continue;
+        chunkAnalyses[i] = existingChunk;
+        cachedCount += 1;
+      } else {
+        pendingIndices.push(i);
       }
+    }
 
+    if (cachedCount > 0) {
+      await onChunkProgress?.(
+        cachedCount / chunks.length,
+        `Expert analysis: ${cachedCount}/${chunks.length} chunks cached`,
+      );
+    }
+
+    const concurrency = Math.min(config.llm.expertConcurrency, Math.max(1, pendingIndices.length));
+    logger.info(
+      `Expert parallel analysis: ${pendingIndices.length} pending, ${cachedCount} cached, concurrency=${concurrency}`,
+    );
+
+    let nextPending = 0;
+    let completed = cachedCount;
+
+    const analyzeChunk = async (i: number): Promise<void> => {
       logger.info(`Expert report agent analyzing evidence chunk ${i + 1}/${chunks.length}`);
-      await onChunkProgress?.(i / chunks.length, `Expert analysis chunk ${i + 1}/${chunks.length}`);
       const chunkAnalysis = await retryUntilSuccess(
         () =>
           llm.chatJson<ExpertReportAnalysis>(
@@ -464,9 +485,30 @@ ${chunks[i]}`,
           ),
         { label: `Expert chunk ${i + 1}/${chunks.length}`, delayMs: 10_000, maxDelayMs: 180_000 },
       );
-      chunkAnalyses.push(chunkAnalysis);
-      writeJson(chunkPath, chunkAnalysis);
-      await onChunkProgress?.((i + 1) / chunks.length, `Expert analysis chunk ${i + 1}/${chunks.length} complete`);
+      chunkAnalyses[i] = chunkAnalysis;
+      writeJson(
+        path.join(reportsDir, `expert-analysis-chunk-${String(i + 1).padStart(3, '0')}.json`),
+        chunkAnalysis,
+      );
+      completed += 1;
+      if (completed % concurrency === 0 || completed === chunks.length) {
+        logger.info(`Expert progress: ${completed}/${chunks.length} chunks complete`);
+        await onChunkProgress?.(completed / chunks.length, `Expert analysis chunk ${completed}/${chunks.length}`);
+      }
+    };
+
+    const workers = Array.from({ length: concurrency }, async () => {
+      while (true) {
+        const slot = nextPending++;
+        if (slot >= pendingIndices.length) break;
+        await analyzeChunk(pendingIndices[slot]!);
+      }
+    });
+    await Promise.all(workers);
+
+    const orderedAnalyses = chunkAnalyses.filter((c): c is ExpertReportAnalysis => c !== null);
+    if (orderedAnalyses.length !== chunks.length) {
+      throw new Error(`Expert analysis incomplete: ${orderedAnalyses.length}/${chunks.length} chunks`);
     }
 
     const analysis = await retryUntilSuccess(
@@ -481,7 +523,10 @@ ${chunks[i]}`,
             {
               role: 'user',
               content: buildExpertReportAnalysisPrompt(
-                { chunkAnalyses, evidenceCoverage: { chunksProcessed: chunks.length, completeEvidenceCharacters: evidenceText.length } },
+                {
+                  chunkAnalyses: orderedAnalyses,
+                  evidenceCoverage: { chunksProcessed: chunks.length, completeEvidenceCharacters: evidenceText.length },
+                },
                 ctx.appName,
               ),
             },
@@ -917,14 +962,15 @@ export async function generateFullReport(
 
   if (hooks.resume?.skipGraphBuild) {
     logger.info('[Generation] Skipping graph-indexing (checkpoint)');
-    const snapshot = await getAnalysisGraphSnapshot(ctx.sessionId).catch(() => null);
-    const nodes = Array.isArray(snapshot?.['nodes']) ? snapshot['nodes'] as unknown[] : [];
-    const edges = Array.isArray(snapshot?.['edges']) ? snapshot['edges'] as unknown[] : [];
-    const findings = Array.isArray(snapshot?.['findings']) ? snapshot['findings'] as unknown[] : [];
+    const counts = await getAnalysisGraphCounts(ctx.sessionId).catch(() => ({
+      nodeCount: 0,
+      edgeCount: 0,
+      findingCount: 0,
+    }));
     graphContext = {
-      nodeCount: nodes.length,
-      edgeCount: edges.length,
-      findingCount: findings.length,
+      nodeCount: counts.nodeCount,
+      edgeCount: counts.edgeCount,
+      findingCount: counts.findingCount,
     };
   } else {
     await hooks.onStageStart?.('graph-indexing', 'Report orchestrator: analysis graph indexing');

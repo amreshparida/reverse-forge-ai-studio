@@ -227,13 +227,19 @@ export function normalizeEntityModel(raw: EntityModel | Record<string, unknown>)
   return { entities };
 }
 
+function asArray<T>(value: unknown): T[] {
+  return Array.isArray(value) ? value : [];
+}
+
 function aggregateEntities(analyses: PageAnalysisResult[]): EntityModel {
   const entityMap = new Map<string, Partial<Entity>>();
 
   for (const analysis of analyses) {
-    if (!analysis.primaryEntity) continue;
+    if (!analysis?.primaryEntity) continue;
 
-    const name = analysis.primaryEntity.trim();
+    const name = String(analysis.primaryEntity).trim();
+    if (!name) continue;
+
     if (!entityMap.has(name)) {
       entityMap.set(name, {
         name,
@@ -251,29 +257,31 @@ function aggregateEntities(analyses: PageAnalysisResult[]): EntityModel {
 
     const entity = entityMap.get(name)!;
 
-    for (const field of analysis.nocobaseFields ?? []) {
+    for (const field of asArray<PageAnalysisResult['nocobaseFields'][number]>(analysis.nocobaseFields)) {
+      if (!field?.field) continue;
       if (field.collection === name || !field.collection) {
         const exists = entity.fields!.some((f) => f.name === field.field);
         if (!exists) {
           entity.fields!.push({
             name: field.field,
-            type: field.type,
+            type: field.type ?? 'string',
             label: field.field,
             required: false,
             unique: false,
             defaultValue: null,
-            options: field.options,
+            options: Array.isArray(field.options) ? field.options : undefined,
           });
         }
       }
     }
 
-    for (const rel of analysis.relationships ?? []) {
+    for (const rel of asArray<PageAnalysisResult['relationships'][number]>(analysis.relationships)) {
+      if (!rel?.from || !rel?.to) continue;
       if (rel.from === name) {
         const exists = entity.relationships!.some((r) => r.entity === rel.to);
         if (!exists) {
           entity.relationships!.push({
-            type: rel.type as EntityRelationship['type'],
+            type: (rel.type as EntityRelationship['type']) || 'belongsTo',
             entity: rel.to,
           });
         }

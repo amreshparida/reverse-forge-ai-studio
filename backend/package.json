@@ -4,9 +4,9 @@
   "description": "AI-powered reverse engineering studio for enterprise web applications",
   "private": true,
   "scripts": {
-    "dev": "tsx watch src/api/server.ts",
+    "dev": "NODE_OPTIONS='--max-old-space-size=8192' tsx watch src/api/server.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/api/server.js",
+    "start": "NODE_OPTIONS='--max-old-space-size=8192' node dist/api/server.js",
     "cli": "tsx src/cli/index.ts",
     "repair-analysis": "tsx src/cli/index.ts repair-analysis",
     "db:generate": "prisma generate",

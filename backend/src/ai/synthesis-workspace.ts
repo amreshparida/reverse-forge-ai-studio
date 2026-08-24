@@ -143,6 +143,8 @@ export async function materializeEvidenceWorkspace(args: {
   includeNetworkCalls?: boolean;
   includeGraphChunks?: boolean;
   graphSnapshot?: unknown;
+  /** Prefer this over graphSnapshot for large graphs — chunks from file text without a full parse. */
+  graphSnapshotFile?: string;
   graphChunkSize?: number;
 }): Promise<SynthesisWorkspace> {
   const root = getSynthesisWorkspaceDir(args.projectSlug, args.sessionId);
@@ -215,14 +217,23 @@ export async function materializeEvidenceWorkspace(args: {
       sourceSessionId: page.crawlSessionId,
     });
 
+    const coerceLabel = (value: unknown): string | null => {
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        return trimmed || null;
+      }
+      if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+      return null;
+    };
+
     index.push({
       id,
       file,
       url: page.url,
       title: page.title,
-      module: analysis.businessModule ?? null,
-      entity: analysis.primaryEntity ?? null,
-      workflowStage: analysis.workflowStage ?? null,
+      module: coerceLabel(analysis.businessModule),
+      entity: coerceLabel(analysis.primaryEntity),
+      workflowStage: coerceLabel(analysis.workflowStage),
       sourceSessionId: page.crawlSessionId,
     });
   }
@@ -326,8 +337,10 @@ export async function materializeEvidenceWorkspace(args: {
   }
 
   const graphChunkIndex: GraphChunkIndexEntry[] = [];
-  if (args.includeGraphChunks && args.graphSnapshot != null) {
-    const text = JSON.stringify(args.graphSnapshot, null, 2);
+  if (args.includeGraphChunks && (args.graphSnapshotFile || args.graphSnapshot != null)) {
+    const text = args.graphSnapshotFile
+      ? fs.readFileSync(args.graphSnapshotFile, 'utf-8')
+      : JSON.stringify(args.graphSnapshot, null, 2);
     const chunkSize = args.graphChunkSize ?? 80_000;
     let offset = 0;
     let i = 0;

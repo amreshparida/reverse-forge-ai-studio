@@ -36,9 +36,15 @@ vi.mock('openai', () => {
 vi.mock('../config', () => ({
   config: {
     llm: {
-      baseUrl: undefined,
+      baseUrl: undefined as string | undefined,
       apiKey: '',
       model: 'gpt-test-default',
+      analysisBaseUrl: undefined as string | undefined,
+      analysisApiKey: undefined as string | undefined,
+      analysisModel: undefined as string | undefined,
+      synthesisBaseUrl: undefined as string | undefined,
+      synthesisApiKey: undefined as string | undefined,
+      synthesisModel: undefined as string | undefined,
     },
   },
 }));
@@ -50,7 +56,8 @@ vi.mock('../utils/logger', () => ({
   },
 }));
 
-import { createLLMClient, isLLMConfigured, LLMClient } from './llm';
+import { config } from '../config';
+import { createLLMClient, isLLMConfigured, LLMClient, resolveAnalysisLlmConfig } from './llm';
 
 describe('LLM service', () => {
   beforeEach(() => {
@@ -172,6 +179,22 @@ describe('LLM service', () => {
       temperature: 1,
     });
     expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it('prefers ANALYSIS_LLM_MODEL for page analysis / OCR', () => {
+    config.llm.analysisModel = 'gpt-4o-mini';
+    try {
+      const resolved = resolveAnalysisLlmConfig({ apiKey: 'key', model: 'gpt-5.5' });
+      expect(resolved.model).toBe('gpt-4o-mini');
+      expect(resolved.apiKey).toBe('key');
+    } finally {
+      config.llm.analysisModel = undefined;
+    }
+  });
+
+  it('falls back to LLM_MODEL when ANALYSIS_LLM_MODEL is unset', () => {
+    const resolved = resolveAnalysisLlmConfig({ apiKey: 'key', model: 'gpt-5.5' });
+    expect(resolved.model).toBe('gpt-5.5');
   });
 
   it('throws a useful error when JSON parsing fails', async () => {

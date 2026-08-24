@@ -164,7 +164,16 @@ function parseJsonFromLLM<T>(raw: string): T {
     throw new Error('Failed to parse JSON from LLM response: empty content (model may have exhausted max tokens on reasoning)');
   }
 
-  // Direct JSON
+  // Direct JSON — also tolerate `{ {` double-brace malformation from some providers
+  const normalized = trimmed.replace(/^\{\s*\{/, '{');
+  if (normalized.startsWith('{') || normalized.startsWith('[')) {
+    try {
+      return JSON.parse(normalized) as T;
+    } catch {
+      // fall through
+    }
+  }
+
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
     try {
       return JSON.parse(trimmed) as T;
@@ -198,6 +207,50 @@ export function createLLMClient(cfg?: LLMConfig): LLMClient {
 
 export function isLLMConfigured(cfg?: LLMConfig): boolean {
   return !!(cfg?.apiKey || config.llm.apiKey);
+}
+
+/**
+ * LLM settings for page-analysis + image OCR.
+ * Prefer ANALYSIS_LLM_* (cheaper / vision model) so LLM_MODEL can stay on a stronger model
+ * for crawl agents, synthesis, and report stages.
+ */
+export function resolveAnalysisLlmConfig(override?: LLMConfig): LLMConfig {
+  const analysisBase = config.llm.analysisBaseUrl;
+  const analysisKey = config.llm.analysisApiKey;
+  const analysisModel = config.llm.analysisModel;
+  const wantsSeparate = !!(analysisBase || analysisKey || analysisModel);
+
+  if (wantsSeparate) {
+    if (analysisBase && !analysisKey && !config.llm.apiKey && !override?.apiKey) {
+      logger.warn(
+        '[Analysis] ANALYSIS_LLM_BASE_URL is set but no ANALYSIS_LLM_API_KEY / LLM_API_KEY — falling back to LLM_*',
+      );
+    } else {
+      return {
+        baseUrl: analysisBase || config.llm.baseUrl || override?.baseUrl,
+        apiKey: analysisKey || config.llm.apiKey || override?.apiKey,
+        model: analysisModel || config.llm.model || override?.model,
+      };
+    }
+  }
+
+  return {
+    baseUrl: override?.baseUrl || config.llm.baseUrl,
+    apiKey: override?.apiKey || config.llm.apiKey,
+    model: override?.model || config.llm.model,
+  };
+}
+
+/**
+ * LLM settings for expert report analysis (long evidence chunks).
+ * Uses primary LLM_* (e.g. gpt-5.5 on OpenAI) — not SYNTHESIS_LLM_* / NVIDIA.
+ */
+export function resolveExpertLlmConfig(override?: LLMConfig): LLMConfig {
+  return {
+    baseUrl: override?.baseUrl || config.llm.baseUrl,
+    apiKey: override?.apiKey || config.llm.apiKey,
+    model: override?.model || config.llm.model,
+  };
 }
 
 /**

@@ -31,6 +31,20 @@ export const config = {
     apiKey: process.env['LLM_API_KEY'] ?? '',
     model: process.env['LLM_MODEL'] ?? 'gpt-4o-mini',
     /**
+     * Optional cheaper / vision-capable model for page-analysis + image OCR only.
+     * Falls back to LLM_* when unset. Must support vision if OCR is enabled.
+     */
+    analysisBaseUrl: process.env['ANALYSIS_LLM_BASE_URL'] || undefined,
+    analysisApiKey: process.env['ANALYSIS_LLM_API_KEY'] || undefined,
+    analysisModel: process.env['ANALYSIS_LLM_MODEL'] || undefined,
+    /** Parallel LLM calls for page-analysis (+ image OCR). Default 5. */
+    analysisConcurrency: Math.max(1, parseInt(process.env['ANALYSIS_CONCURRENCY'] ?? '5', 10) || 5),
+    /** Parallel LLM calls for expert report chunk analysis. Default 3 (large prompts). */
+    expertConcurrency: Math.max(
+      1,
+      parseInt(process.env['EXPERT_CONCURRENCY'] ?? process.env['ANALYSIS_CONCURRENCY'] ?? '3', 10) || 3,
+    ),
+    /**
      * After page-analysis: explore local page-analysis files via tools (Cursor-style)
      * instead of stuffing all JSON into one prompt. Set SYNTHESIS_AGENT=false to use legacy chatJson.
      */

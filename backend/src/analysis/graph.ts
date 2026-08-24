@@ -3,7 +3,7 @@ import fs from 'fs';
 import { createHash } from 'crypto';
 import { prisma } from '../database/client';
 import { createLLMClient, isLLMConfigured, type LLMConfig } from '../ai/llm';
-import { getSessionOutputDir, writeJson } from '../utils/file-system';
+import { ensureDir, getSessionOutputDir, writeJson } from '../utils/file-system';
 import { logger } from '../utils/logger';
 import { retryUntilSuccess } from '../utils/retry';
 import type { EntityModel } from '../inference/entity';
@@ -53,14 +53,65 @@ type GraphEdgeInput = {
 
 export type GraphFindingInput = {
   agent: string;
-  category: string;
+  category?: string;
   severity?: string;
   title: string;
   detail: string;
-  evidenceNodeIds?: string[];
+  evidenceNodeIds?: string[] | string;
   recommendation?: string;
   confidence?: number;
 };
+
+const AGENT_DEFAULT_CATEGORY: Record<string, string> = {
+  'ui-ux-agent': 'ux',
+  'api-integration-agent': 'api',
+  'data-engineer-agent': 'data',
+  'domain-product-agent': 'domain',
+  'security-compliance-agent': 'security',
+  'solution-architect-agent': 'architecture',
+  'gap-validator': 'gap',
+};
+
+function normalizeEvidenceNodeIds(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) {
+    const ids = value.filter((id): id is string => typeof id === 'string' && id.trim().length > 0);
+    return ids.length > 0 ? ids : undefined;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = parseJsonSafe<string[]>(value);
+    if (Array.isArray(parsed)) {
+      const ids = parsed.filter((id): id is string => typeof id === 'string' && id.trim().length > 0);
+      return ids.length > 0 ? ids : undefined;
+    }
+  }
+  return undefined;
+}
+
+export function normalizeGraphFindingInput(
+  finding: Partial<GraphFindingInput> & Pick<GraphFindingInput, 'agent' | 'title' | 'detail'>,
+): Required<Pick<GraphFindingInput, 'agent' | 'category' | 'title' | 'detail'>> &
+  Pick<GraphFindingInput, 'severity' | 'recommendation' | 'confidence'> & {
+    evidenceNodeIds?: string[];
+  } {
+  const category =
+    (typeof finding.category === 'string' && finding.category.trim()) ||
+    AGENT_DEFAULT_CATEGORY[finding.agent] ||
+    'general';
+
+  return {
+    agent: finding.agent,
+    category,
+    severity: typeof finding.severity === 'string' && finding.severity.trim() ? finding.severity : undefined,
+    title: finding.title,
+    detail: finding.detail,
+    evidenceNodeIds: normalizeEvidenceNodeIds(finding.evidenceNodeIds),
+    recommendation:
+      typeof finding.recommendation === 'string' && finding.recommendation.trim()
+        ? finding.recommendation
+        : undefined,
+    confidence: typeof finding.confidence === 'number' ? finding.confidence : undefined,
+  };
+}
 
 export type AnalysisGraphContext = {
   projectId: string;
@@ -201,20 +252,21 @@ async function upsertEdge(projectId: string, sessionId: string, input: GraphEdge
 export async function addAnalysisFinding(
   projectId: string,
   sessionId: string,
-  finding: GraphFindingInput,
+  finding: Partial<GraphFindingInput> & Pick<GraphFindingInput, 'agent' | 'title' | 'detail'>,
 ): Promise<void> {
+  const normalized = normalizeGraphFindingInput(finding);
   await prisma.analysisFinding.create({
     data: {
       projectId,
       crawlSessionId: sessionId,
-      agent: finding.agent,
-      category: finding.category,
-      severity: finding.severity,
-      title: finding.title,
-      detail: finding.detail,
-      evidenceNodeIds: finding.evidenceNodeIds ? stringify(finding.evidenceNodeIds) : null,
-      recommendation: finding.recommendation,
-      confidence: finding.confidence,
+      agent: normalized.agent,
+      category: normalized.category,
+      severity: normalized.severity,
+      title: normalized.title,
+      detail: normalized.detail,
+      evidenceNodeIds: normalized.evidenceNodeIds ? stringify(normalized.evidenceNodeIds) : null,
+      recommendation: normalized.recommendation,
+      confidence: normalized.confidence,
     },
   });
 }
@@ -558,8 +610,7 @@ export async function buildAnalysisGraph(params: {
     prisma.analysisFinding.count({ where: { crawlSessionId: sessionId } }),
   ]);
 
-  const snapshot = await getAnalysisGraphSnapshot(sessionId);
-  writeJson(path.join(reportsDir, 'analysis-graph.json'), snapshot);
+  await writeAnalysisGraphSnapshotFile(sessionId, path.join(reportsDir, 'analysis-graph.json'));
   logger.info(`Analysis graph built: ${nodeCount} nodes, ${edgeCount} edges, ${findingCount} findings`);
 
   return { projectId, sessionId, sourceSessionIds, appName, reportsDir, nodeCount, edgeCount, findingCount };
@@ -610,48 +661,338 @@ async function runDeterministicGapValidator(projectId: string, sessionId: string
   }
 }
 
-export async function getAnalysisGraphSnapshot(sessionId: string): Promise<Record<string, unknown>> {
-  const [nodes, edges, findings] = await Promise.all([
-    prisma.analysisGraphNode.findMany({ where: { crawlSessionId: sessionId }, orderBy: [{ kind: 'asc' }, { label: 'asc' }] }),
-    prisma.analysisGraphEdge.findMany({ where: { crawlSessionId: sessionId }, orderBy: [{ kind: 'asc' }, { createdAt: 'asc' }] }),
-    prisma.analysisFinding.findMany({ where: { crawlSessionId: sessionId }, orderBy: [{ severity: 'desc' }, { createdAt: 'asc' }] }),
-  ]);
+const GRAPH_SNAPSHOT_BATCH = 250;
 
+function createJsonWriteStream(outPath: string): {
+  write: (chunk: string) => Promise<void>;
+  end: () => Promise<void>;
+} {
+  ensureDir(path.dirname(outPath));
+  const stream = fs.createWriteStream(outPath, { encoding: 'utf-8' });
+  let streamError: Error | null = null;
+  stream.on('error', (err) => {
+    streamError = err;
+  });
+
+  const write = (chunk: string) =>
+    new Promise<void>((resolve, reject) => {
+      if (streamError) {
+        reject(streamError);
+        return;
+      }
+      if (stream.write(chunk)) {
+        resolve();
+        return;
+      }
+      stream.once('drain', () => {
+        if (streamError) reject(streamError);
+        else resolve();
+      });
+    });
+
+  const end = () =>
+    new Promise<void>((resolve, reject) => {
+      stream.end(() => {
+        if (streamError) reject(streamError);
+        else resolve();
+      });
+    });
+
+  return { write, end };
+}
+
+/** Lightweight counts — never loads node/edge/finding payloads. */
+export async function getAnalysisGraphCounts(sessionId: string): Promise<{
+  nodeCount: number;
+  edgeCount: number;
+  findingCount: number;
+}> {
+  const [nodeCount, edgeCount, findingCount] = await Promise.all([
+    prisma.analysisGraphNode.count({ where: { crawlSessionId: sessionId } }),
+    prisma.analysisGraphEdge.count({ where: { crawlSessionId: sessionId } }),
+    prisma.analysisFinding.count({ where: { crawlSessionId: sessionId } }),
+  ]);
+  return { nodeCount, edgeCount, findingCount };
+}
+
+/**
+ * Stream-write the analysis graph to disk in batches so large projects
+ * (thousands of nodes) do not OOM from JSON.parse + Array.map of the full set.
+ */
+export async function writeAnalysisGraphSnapshotFile(
+  sessionId: string,
+  outPath: string,
+): Promise<{ nodeCount: number; edgeCount: number; findingCount: number }> {
+  const { write, end } = createJsonWriteStream(outPath);
+
+  await write('{\n  "nodes": [\n');
+  let nodeCount = 0;
+  let skip = 0;
+  for (;;) {
+    const nodes = await prisma.analysisGraphNode.findMany({
+      where: { crawlSessionId: sessionId },
+      orderBy: [{ kind: 'asc' }, { label: 'asc' }],
+      skip,
+      take: GRAPH_SNAPSHOT_BATCH,
+    });
+    if (nodes.length === 0) break;
+    for (const node of nodes) {
+      const row = JSON.stringify({
+        id: node.id,
+        kind: node.kind,
+        key: node.key,
+        label: node.label,
+        properties: parseJsonSafe(node.properties) ?? node.properties,
+        source: node.source,
+        confidence: node.confidence,
+      });
+      await write(`${nodeCount > 0 ? ',\n' : ''}    ${row}`);
+      nodeCount += 1;
+    }
+    skip += nodes.length;
+  }
+
+  await write('\n  ],\n  "edges": [\n');
+  let edgeCount = 0;
+  skip = 0;
+  for (;;) {
+    const edges = await prisma.analysisGraphEdge.findMany({
+      where: { crawlSessionId: sessionId },
+      orderBy: [{ kind: 'asc' }, { createdAt: 'asc' }],
+      skip,
+      take: GRAPH_SNAPSHOT_BATCH,
+    });
+    if (edges.length === 0) break;
+    for (const edge of edges) {
+      const row = JSON.stringify({
+        id: edge.id,
+        fromNodeId: edge.fromNodeId,
+        toNodeId: edge.toNodeId,
+        kind: edge.kind,
+        label: edge.label,
+        properties: parseJsonSafe(edge.properties ?? undefined) ?? edge.properties,
+        source: edge.source,
+        confidence: edge.confidence,
+      });
+      await write(`${edgeCount > 0 ? ',\n' : ''}    ${row}`);
+      edgeCount += 1;
+    }
+    skip += edges.length;
+  }
+
+  await write('\n  ],\n  "findings": [\n');
+  let findingCount = 0;
+  skip = 0;
+  for (;;) {
+    const findings = await prisma.analysisFinding.findMany({
+      where: { crawlSessionId: sessionId },
+      orderBy: [{ severity: 'desc' }, { createdAt: 'asc' }],
+      skip,
+      take: GRAPH_SNAPSHOT_BATCH,
+    });
+    if (findings.length === 0) break;
+    for (const finding of findings) {
+      const row = JSON.stringify({
+        id: finding.id,
+        agent: finding.agent,
+        category: finding.category,
+        severity: finding.severity,
+        title: finding.title,
+        detail: finding.detail,
+        evidenceNodeIds: parseJsonSafe(finding.evidenceNodeIds ?? undefined) ?? [],
+        recommendation: finding.recommendation,
+        confidence: finding.confidence,
+      });
+      await write(`${findingCount > 0 ? ',\n' : ''}    ${row}`);
+      findingCount += 1;
+    }
+    skip += findings.length;
+  }
+
+  await write('\n  ]\n}\n');
+  await end();
+
+  return { nodeCount, edgeCount, findingCount };
+}
+
+/**
+ * In-memory snapshot — prefer {@link writeAnalysisGraphSnapshotFile} for large graphs.
+ * Kept for callers that need a compact object; loads in batches to reduce peak pressure.
+ */
+export async function getAnalysisGraphSnapshot(sessionId: string): Promise<Record<string, unknown>> {
+  const nodes: Array<Record<string, unknown>> = [];
+  const edges: Array<Record<string, unknown>> = [];
+  const findings: Array<Record<string, unknown>> = [];
+
+  for (let skip = 0; ; skip += GRAPH_SNAPSHOT_BATCH) {
+    const batch = await prisma.analysisGraphNode.findMany({
+      where: { crawlSessionId: sessionId },
+      orderBy: [{ kind: 'asc' }, { label: 'asc' }],
+      skip,
+      take: GRAPH_SNAPSHOT_BATCH,
+    });
+    if (batch.length === 0) break;
+    for (const node of batch) {
+      nodes.push({
+        id: node.id,
+        kind: node.kind,
+        key: node.key,
+        label: node.label,
+        properties: parseJsonSafe(node.properties) ?? node.properties,
+        source: node.source,
+        confidence: node.confidence,
+      });
+    }
+  }
+
+  for (let skip = 0; ; skip += GRAPH_SNAPSHOT_BATCH) {
+    const batch = await prisma.analysisGraphEdge.findMany({
+      where: { crawlSessionId: sessionId },
+      orderBy: [{ kind: 'asc' }, { createdAt: 'asc' }],
+      skip,
+      take: GRAPH_SNAPSHOT_BATCH,
+    });
+    if (batch.length === 0) break;
+    for (const edge of batch) {
+      edges.push({
+        id: edge.id,
+        fromNodeId: edge.fromNodeId,
+        toNodeId: edge.toNodeId,
+        kind: edge.kind,
+        label: edge.label,
+        properties: parseJsonSafe(edge.properties ?? undefined) ?? edge.properties,
+        source: edge.source,
+        confidence: edge.confidence,
+      });
+    }
+  }
+
+  for (let skip = 0; ; skip += GRAPH_SNAPSHOT_BATCH) {
+    const batch = await prisma.analysisFinding.findMany({
+      where: { crawlSessionId: sessionId },
+      orderBy: [{ severity: 'desc' }, { createdAt: 'asc' }],
+      skip,
+      take: GRAPH_SNAPSHOT_BATCH,
+    });
+    if (batch.length === 0) break;
+    for (const finding of batch) {
+      findings.push({
+        id: finding.id,
+        agent: finding.agent,
+        category: finding.category,
+        severity: finding.severity,
+        title: finding.title,
+        detail: finding.detail,
+        evidenceNodeIds: parseJsonSafe(finding.evidenceNodeIds ?? undefined) ?? [],
+        recommendation: finding.recommendation,
+        confidence: finding.confidence,
+      });
+    }
+  }
+
+  return { nodes, edges, findings };
+}
+
+function pickEvidencePointer(propertiesRaw: string | null | undefined): Record<string, unknown> {
+  const props = parseJsonSafe<Record<string, unknown>>(propertiesRaw) ?? {};
   return {
-    nodes: nodes.map((node) => ({
-      id: node.id,
-      kind: node.kind,
-      key: node.key,
-      label: node.label,
-      properties: parseJsonSafe(node.properties) ?? node.properties,
-      source: node.source,
-      confidence: node.confidence,
-    })),
-    edges: edges.map((edge) => ({
-      id: edge.id,
-      fromNodeId: edge.fromNodeId,
-      toNodeId: edge.toNodeId,
-      kind: edge.kind,
-      label: edge.label,
-      properties: parseJsonSafe(edge.properties ?? undefined) ?? edge.properties,
-      source: edge.source,
-      confidence: edge.confidence,
-    })),
-    findings: findings.map((finding) => ({
-      id: finding.id,
-      agent: finding.agent,
-      category: finding.category,
-      severity: finding.severity,
-      title: finding.title,
-      detail: finding.detail,
-      evidenceNodeIds: parseJsonSafe(finding.evidenceNodeIds ?? undefined) ?? [],
-      recommendation: finding.recommendation,
-      confidence: finding.confidence,
-    })),
+    pageUrl: props['url'],
+    apiUrl: props['url'] ?? props['endpoint'],
+    screenshotPath: props['screenshotPath'],
+    fullScreenshotPath: props['fullScreenshotPath'],
   };
 }
 
+export async function writeEvidenceCitationMapFile(sessionId: string, outPath: string): Promise<void> {
+  const { write, end } = createJsonWriteStream(outPath);
+
+  const inbound = new Map<string, number>();
+  const outbound = new Map<string, number>();
+  for (let skip = 0; ; skip += GRAPH_SNAPSHOT_BATCH) {
+    const edges = await prisma.analysisGraphEdge.findMany({
+      where: { crawlSessionId: sessionId },
+      select: { fromNodeId: true, toNodeId: true },
+      skip,
+      take: GRAPH_SNAPSHOT_BATCH,
+    });
+    if (edges.length === 0) break;
+    for (const edge of edges) {
+      outbound.set(edge.fromNodeId, (outbound.get(edge.fromNodeId) ?? 0) + 1);
+      inbound.set(edge.toNodeId, (inbound.get(edge.toNodeId) ?? 0) + 1);
+    }
+  }
+
+  const nodeMeta = new Map<string, { kind: string; label: string; source: string | null }>();
+
+  await write('{\n  "nodes": [\n');
+  let nodeCount = 0;
+  for (let skip = 0; ; skip += GRAPH_SNAPSHOT_BATCH) {
+    const nodes = await prisma.analysisGraphNode.findMany({
+      where: { crawlSessionId: sessionId },
+      orderBy: [{ kind: 'asc' }, { label: 'asc' }],
+      skip,
+      take: GRAPH_SNAPSHOT_BATCH,
+    });
+    if (nodes.length === 0) break;
+    for (const node of nodes) {
+      nodeMeta.set(node.id, { kind: node.kind, label: node.label, source: node.source });
+      const row = JSON.stringify({
+        id: node.id,
+        kind: node.kind,
+        label: node.label,
+        source: node.source,
+        confidence: node.confidence,
+        evidencePointer: pickEvidencePointer(node.properties),
+        inboundEdges: inbound.get(node.id) ?? 0,
+        outboundEdges: outbound.get(node.id) ?? 0,
+      });
+      await write(`${nodeCount > 0 ? ',\n' : ''}    ${row}`);
+      nodeCount += 1;
+    }
+  }
+
+  await write('\n  ],\n  "findings": [\n');
+  let findingCount = 0;
+  for (let skip = 0; ; skip += GRAPH_SNAPSHOT_BATCH) {
+    const findings = await prisma.analysisFinding.findMany({
+      where: { crawlSessionId: sessionId },
+      orderBy: [{ agent: 'asc' }, { createdAt: 'asc' }],
+      skip,
+      take: GRAPH_SNAPSHOT_BATCH,
+    });
+    if (findings.length === 0) break;
+    for (const finding of findings) {
+      const evidenceIds = parseJsonSafe<string[]>(finding.evidenceNodeIds ?? undefined) ?? [];
+      const row = JSON.stringify({
+        id: finding.id,
+        agent: finding.agent,
+        category: finding.category,
+        severity: finding.severity,
+        title: finding.title,
+        evidence: evidenceIds.map((id) => {
+          const node = nodeMeta.get(id);
+          return node ? { id, kind: node.kind, label: node.label, source: node.source } : { id, missing: true };
+        }),
+      });
+      await write(`${findingCount > 0 ? ',\n' : ''}    ${row}`);
+      findingCount += 1;
+    }
+  }
+
+  await write('\n  ]\n}\n');
+  await end();
+}
+
 export async function buildEvidenceCitationMap(sessionId: string): Promise<Record<string, unknown>> {
+  // Prefer streaming to disk; this in-memory path is only for small graphs / tests.
+  const counts = await getAnalysisGraphCounts(sessionId);
+  if (counts.nodeCount > 2_000) {
+    logger.warn(
+      `[Graph] buildEvidenceCitationMap in-memory skipped for large graph (${counts.nodeCount} nodes) — use writeEvidenceCitationMapFile`,
+    );
+    return { nodes: [], findings: [], streamed: true, ...counts };
+  }
+
   const [nodes, edges, findings] = await Promise.all([
     prisma.analysisGraphNode.findMany({ where: { crawlSessionId: sessionId }, orderBy: [{ kind: 'asc' }, { label: 'asc' }] }),
     prisma.analysisGraphEdge.findMany({ where: { crawlSessionId: sessionId }, orderBy: [{ kind: 'asc' }, { createdAt: 'asc' }] }),
@@ -667,24 +1008,16 @@ export async function buildEvidenceCitationMap(sessionId: string): Promise<Recor
   }
 
   return {
-    nodes: nodes.map((node) => {
-      const props = parseJsonSafe<Record<string, unknown>>(node.properties) ?? {};
-      return {
-        id: node.id,
-        kind: node.kind,
-        label: node.label,
-        source: node.source,
-        confidence: node.confidence,
-        evidencePointer: {
-          pageUrl: props['url'],
-          apiUrl: props['url'] ?? props['endpoint'],
-          screenshotPath: props['screenshotPath'],
-          fullScreenshotPath: props['fullScreenshotPath'],
-        },
-        inboundEdges: inbound.get(node.id) ?? 0,
-        outboundEdges: outbound.get(node.id) ?? 0,
-      };
-    }),
+    nodes: nodes.map((node) => ({
+      id: node.id,
+      kind: node.kind,
+      label: node.label,
+      source: node.source,
+      confidence: node.confidence,
+      evidencePointer: pickEvidencePointer(node.properties),
+      inboundEdges: inbound.get(node.id) ?? 0,
+      outboundEdges: outbound.get(node.id) ?? 0,
+    })),
     findings: findings.map((finding) => {
       const evidenceIds = parseJsonSafe<string[]>(finding.evidenceNodeIds ?? undefined) ?? [];
       return {
@@ -703,12 +1036,44 @@ export async function buildEvidenceCitationMap(sessionId: string): Promise<Recor
 }
 
 export async function computeAnalysisCoverage(sessionId: string, sourceSessionIds: string[] = [sessionId]): Promise<Record<string, unknown>> {
-  const [nodes, edges, findings, pages, calls] = await Promise.all([
-    prisma.analysisGraphNode.findMany({ where: { crawlSessionId: sessionId }, select: { id: true, kind: true, confidence: true } }),
-    prisma.analysisGraphEdge.findMany({ where: { crawlSessionId: sessionId }, select: { fromNodeId: true, toNodeId: true, kind: true } }),
-    prisma.analysisFinding.findMany({ where: { crawlSessionId: sessionId }, select: { category: true, severity: true, evidenceNodeIds: true } }),
-    prisma.pageCapture.findMany({ where: { crawlSessionId: { in: sourceSessionIds } }, select: { id: true, url: true, aiAnalysis: true, extractedData: true } }),
-    prisma.networkCall.findMany({ where: { crawlSessionId: { in: sourceSessionIds } }, select: { id: true, requestPayload: true, responseBody: true, responseStatus: true } }),
+  // Count-only queries — never load aiAnalysis / extractedData / response bodies.
+  const [
+    nodes,
+    edges,
+    findings,
+    pageCount,
+    pagesWithExtracted,
+    pagesWithAi,
+    callCount,
+    callsWithPayload,
+    callsWithResponse,
+  ] = await Promise.all([
+    prisma.analysisGraphNode.findMany({
+      where: { crawlSessionId: sessionId },
+      select: { id: true, kind: true, confidence: true },
+    }),
+    prisma.analysisGraphEdge.findMany({
+      where: { crawlSessionId: sessionId },
+      select: { fromNodeId: true, toNodeId: true, kind: true },
+    }),
+    prisma.analysisFinding.findMany({
+      where: { crawlSessionId: sessionId },
+      select: { category: true, severity: true, evidenceNodeIds: true },
+    }),
+    prisma.pageCapture.count({ where: { crawlSessionId: { in: sourceSessionIds } } }),
+    prisma.pageCapture.count({
+      where: { crawlSessionId: { in: sourceSessionIds }, extractedData: { not: null } },
+    }),
+    prisma.pageCapture.count({
+      where: { crawlSessionId: { in: sourceSessionIds }, aiAnalysis: { not: null } },
+    }),
+    prisma.networkCall.count({ where: { crawlSessionId: { in: sourceSessionIds } } }),
+    prisma.networkCall.count({
+      where: { crawlSessionId: { in: sourceSessionIds }, requestPayload: { not: null } },
+    }),
+    prisma.networkCall.count({
+      where: { crawlSessionId: { in: sourceSessionIds }, responseBody: { not: null } },
+    }),
   ]);
 
   const countBy = <T extends string>(items: T[]): Record<T, number> =>
@@ -728,18 +1093,13 @@ export async function computeAnalysisCoverage(sessionId: string, sourceSessionId
     return ids.length > 0;
   }).length;
 
-  const pagesWithExtracted = pages.filter((page) => Boolean(page.extractedData)).length;
-  const pagesWithAi = pages.filter((page) => Boolean(page.aiAnalysis)).length;
-  const callsWithPayload = calls.filter((call) => Boolean(call.requestPayload)).length;
-  const callsWithResponse = calls.filter((call) => Boolean(call.responseBody)).length;
   const lowConfidenceNodes = nodes.filter((node) => typeof node.confidence === 'number' && node.confidence < 0.7).length;
 
-  // Absence of evidence is not complete coverage. Empty corpora must never score 100.
   const ratios = {
-    pagesWithExtractedData: pages.length ? pagesWithExtracted / pages.length : 0,
-    pagesWithAiAnalysis: pages.length ? pagesWithAi / pages.length : 0,
-    apiCallsWithRequestPayload: calls.length ? callsWithPayload / calls.length : 0,
-    apiCallsWithResponseBody: calls.length ? callsWithResponse / calls.length : 0,
+    pagesWithExtractedData: pageCount ? pagesWithExtracted / pageCount : 0,
+    pagesWithAiAnalysis: pageCount ? pagesWithAi / pageCount : 0,
+    apiCallsWithRequestPayload: callCount ? callsWithPayload / callCount : 0,
+    apiCallsWithResponseBody: callCount ? callsWithResponse / callCount : 0,
     findingsWithEvidence: findings.length ? findingsWithEvidence / findings.length : 0,
     graphConnectedNodes: nodes.length ? connectedIds.size / nodes.length : 0,
   };
@@ -754,14 +1114,14 @@ export async function computeAnalysisCoverage(sessionId: string, sourceSessionId
 
   return {
     score: coverageScore,
-    insufficientEvidence: pages.length === 0 || nodes.length === 0 || findings.length === 0,
+    insufficientEvidence: pageCount === 0 || nodes.length === 0 || findings.length === 0,
     ratios,
     counts: {
       nodes: nodes.length,
       edges: edges.length,
       findings: findings.length,
-      pages: pages.length,
-      networkCalls: calls.length,
+      pages: pageCount,
+      networkCalls: callCount,
       pagesWithExtractedData: pagesWithExtracted,
       pagesWithAiAnalysis: pagesWithAi,
       apiCallsWithRequestPayload: callsWithPayload,
@@ -778,15 +1138,12 @@ export async function computeAnalysisCoverage(sessionId: string, sourceSessionId
 }
 
 export async function finalizeAnalysisGraphArtifacts(sessionId: string, reportsDir: string, sourceSessionIds: string[] = [sessionId]): Promise<Record<string, unknown>> {
+  logger.info(`[Graph] Finalizing analysis artifacts for ${sessionId} (streamed, memory-safe)`);
   const dedupe = await dedupeAnalysisFindings(sessionId);
-  const [snapshot, citationMap, coverage] = await Promise.all([
-    getAnalysisGraphSnapshot(sessionId),
-    buildEvidenceCitationMap(sessionId),
-    computeAnalysisCoverage(sessionId, sourceSessionIds),
-  ]);
+  const coverage = await computeAnalysisCoverage(sessionId, sourceSessionIds);
 
-  writeJson(path.join(reportsDir, 'analysis-graph-enriched.json'), snapshot);
-  writeJson(path.join(reportsDir, 'evidence-citation-map.json'), citationMap);
+  await writeAnalysisGraphSnapshotFile(sessionId, path.join(reportsDir, 'analysis-graph-enriched.json'));
+  await writeEvidenceCitationMapFile(sessionId, path.join(reportsDir, 'evidence-citation-map.json'));
   writeJson(path.join(reportsDir, 'analysis-coverage.json'), coverage);
   writeJson(path.join(reportsDir, 'finding-dedupe-summary.json'), dedupe);
 
@@ -832,16 +1189,13 @@ export async function finalizeAnalysisGraphArtifacts(sessionId: string, reportsD
     }
   }
 
-  const [finalSnapshot, finalCitationMap, finalCoverage] = await Promise.all([
-    getAnalysisGraphSnapshot(sessionId),
-    buildEvidenceCitationMap(sessionId),
-    computeAnalysisCoverage(sessionId, sourceSessionIds),
-  ]);
-
-  writeJson(path.join(reportsDir, 'analysis-graph-enriched.json'), finalSnapshot);
-  writeJson(path.join(reportsDir, 'evidence-citation-map.json'), finalCitationMap);
+  // Re-write coverage after optional validator findings (graph file already on disk; avoid second full load)
+  const finalCoverage = await computeAnalysisCoverage(sessionId, sourceSessionIds);
   writeJson(path.join(reportsDir, 'analysis-coverage.json'), finalCoverage);
+  await writeAnalysisGraphSnapshotFile(sessionId, path.join(reportsDir, 'analysis-graph-enriched.json'));
+  await writeEvidenceCitationMapFile(sessionId, path.join(reportsDir, 'evidence-citation-map.json'));
 
+  logger.info(`[Graph] Finalization complete for ${sessionId}`);
   return { dedupe, coverage: finalCoverage };
 }
 
@@ -871,7 +1225,33 @@ export async function runSpecialistGraphAgents(params: {
     { name: 'solution-architect-agent', focus: 'architecture style, frontend/backend boundaries, scalability, modernization, technical debt' },
   ];
 
-  const snapshot = await getAnalysisGraphSnapshot(params.sessionId);
+  function specialistArtifactReady(agentName: string): boolean {
+    const filePath = path.join(params.reportsDir, `${agentName}-findings.json`);
+    if (!fs.existsSync(filePath)) return false;
+    try {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as unknown;
+      // File present means the agent finished (even if findings[] is empty).
+      if (Array.isArray(raw)) return true;
+      if (raw && typeof raw === 'object' && Array.isArray((raw as { findings?: unknown }).findings)) {
+        return true;
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  }
+
+  const pendingAgents = agents.filter((agent) => !specialistArtifactReady(agent.name));
+  if (pendingAgents.length === 0) {
+    logger.info('[Specialist] All specialist findings already on disk — skipping agent runs');
+    await finalizeAnalysisGraphArtifacts(
+      params.sessionId,
+      params.reportsDir,
+      params.sourceSessionIds?.length ? params.sourceSessionIds : [params.sessionId],
+    );
+    return;
+  }
+
   const { config } = await import('../config.js');
 
   if (config.llm.synthesisAgentEnabled) {
@@ -885,8 +1265,10 @@ export async function runSpecialistGraphAgents(params: {
     const { runSynthesisAgent } = await import('../ai/synthesis-agent.js');
     const { writeJson: writeJsonFs } = await import('../utils/file-system.js');
 
-    // Materialize graph chunks once. Each specialist independently drains them and keeps
-    // its own reasoning pass so one specialist's interpretation cannot anchor the others.
+    // Stream graph to disk and chunk from the file — never hold a full parsed graph object.
+    const graphSnapshotPath = path.join(params.reportsDir, '_generation', 'analysis-graph-for-specialists.json');
+    await writeAnalysisGraphSnapshotFile(params.sessionId, graphSnapshotPath);
+
     const workspace = await materializeEvidenceWorkspace({
       projectId: params.projectId,
       projectSlug: project.slug,
@@ -894,11 +1276,11 @@ export async function runSpecialistGraphAgents(params: {
       sourceSessionIds: params.sourceSessionIds,
       includeNetworkCalls: false,
       includeGraphChunks: true,
-      graphSnapshot: snapshot,
+      graphSnapshotFile: graphSnapshotPath,
       graphChunkSize: 200_000,
     });
 
-    for (const agent of agents) {
+    for (const agent of pendingAgents) {
       const artifactName = `${agent.name}-findings.json`;
 
       const { artifact, steps, coverage } = await retryUntilSuccess(
@@ -935,11 +1317,13 @@ export async function runSpecialistGraphAgents(params: {
   }
 
   // Legacy chunked chatJson path
+  const snapshotPath = path.join(params.reportsDir, '_generation', 'analysis-graph-for-specialists.json');
+  await writeAnalysisGraphSnapshotFile(params.sessionId, snapshotPath);
+  const snapshotText = fs.readFileSync(snapshotPath, 'utf-8');
   const llm = createLLMClient(params.llmConfig);
-  const snapshotText = JSON.stringify(snapshot, null, 2);
   const chunks = chunkString(snapshotText, 80_000);
 
-  for (const agent of agents) {
+  for (const agent of pendingAgents) {
     const agentFindings: GraphFindingInput[] = [];
     for (let i = 0; i < chunks.length; i++) {
       logger.info(`${agent.name} analyzing graph chunk ${i + 1}/${chunks.length}`);
