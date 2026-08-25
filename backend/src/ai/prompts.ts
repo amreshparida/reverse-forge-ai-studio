@@ -427,7 +427,28 @@ Return JSON:
 }
 
 Evidence package:
-${JSON.stringify(evidence, null, 2)}
+${JSON.stringify(evidence)}
 
 Return only valid JSON.`;
+}
+
+/** Lightweight intermediate merge — consolidates chunk findings without the full report schema. */
+export function buildExpertMergeBatchPrompt(
+  chunkAnalyses: unknown[],
+  appName?: string,
+): string {
+  const context = appName ? `Application: "${appName}". ` : '';
+  return `${context}Consolidate these expert evidence-chunk analyses into one deduplicated partial summary.
+Keep the strongest distinct findings only. Prefer concrete evidence. Do not invent unsupported details.
+Return only valid JSON:
+{
+  "observations": [{"area": "domain|product|architecture|data|api|security|workflow|ux|operations", "finding": "finding"}],
+  "entities": [{"name": "entity", "fields": ["field"]}],
+  "apis": [{"method": "GET", "url": "url", "purpose": "purpose"}],
+  "risks": [{"area": "area", "severity": "critical|high|medium|low", "risk": "risk"}],
+  "recommendations": [{"owner": "Architect|Data|Product|Engineering|Security", "priority": "critical|high|medium|low", "recommendation": "recommendation"}]
+}
+
+Chunk analyses (${chunkAnalyses.length}):
+${JSON.stringify(chunkAnalyses)}`;
 }

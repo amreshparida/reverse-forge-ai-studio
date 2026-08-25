@@ -7,8 +7,8 @@ import { permissionMatrixToCsv } from '../inference/permissions';
 import { inferArchitecture, buildKnowledgeGraph, type ArchitectureAnalysis } from '../ai/analyzer';
 import { runDeepResearch, type DeepResearchReport } from '../ai/deep-research';
 import { type HarIntelligenceBriefing } from '../ai/har-intelligence';
-import { createLLMClient, isLLMConfigured, resolveSynthesisLlmConfig } from '../ai/llm';
-import { buildExpertReportAnalysisPrompt } from '../ai/prompts';
+import { createLLMClient, isLLMConfigured, resolveExpertLlmConfig, resolveSynthesisLlmConfig } from '../ai/llm';
+import { buildExpertMergeBatchPrompt, buildExpertReportAnalysisPrompt } from '../ai/prompts';
 import { config } from '../config';
 import { buildAnalysisGraph, getAnalysisGraphCounts, finalizeAnalysisGraphArtifacts, runSpecialistGraphAgents } from '../analysis/graph';
 import { logger } from '../utils/logger';
@@ -122,6 +122,224 @@ function truncateText(value: unknown, maxChars: number): unknown {
   if (typeof value !== 'string') return value;
   if (value.length <= maxChars) return value;
   return `${value.slice(0, maxChars)}…[truncated ${value.length - maxChars} chars]`;
+}
+
+/** Keep final synthesis prompts under ~150k tokens (~600k chars) for reliability. */
+const EXPERT_FINAL_MERGE_MAX_CHARS = 600_000;
+/** Intermediate LLM merges stay small so NVIDIA finishes within timeout. */
+const EXPERT_MERGE_BATCH_SIZE = 12;
+const EXPERT_MERGE_CONCURRENCY = 2;
+
+function compactExpertChunkAnalysis(chunk: ExpertReportAnalysis): Record<string, unknown> {
+  const take = <T>(
+    arr: unknown,
+    max: number,
+    map: (item: Record<string, unknown>) => T,
+  ): T[] => {
+    if (!Array.isArray(arr)) return [];
+    return arr.slice(0, max).map((item) => map(item as Record<string, unknown>));
+  };
+
+  return {
+    chunk: chunk['chunk'],
+    observations: take(chunk['observations'], 4, (o) => ({
+      area: o['area'],
+      finding: truncateText(o['finding'], 140),
+    })),
+    entities: take(chunk['entities'], 3, (e) => ({
+      name: e['name'],
+      fields: Array.isArray(e['fields']) ? (e['fields'] as unknown[]).slice(0, 4) : [],
+    })),
+    apis: take(chunk['apis'], 3, (a) => ({
+      method: a['method'],
+      url: truncateText(a['url'], 80),
+      purpose: truncateText(a['purpose'], 80),
+    })),
+    risks: take(chunk['risks'], 3, (r) => ({
+      area: r['area'],
+      severity: r['severity'],
+      risk: truncateText(r['risk'], 140),
+    })),
+    recommendations: take(chunk['recommendations'], 3, (r) => ({
+      owner: r['owner'],
+      priority: r['priority'],
+      recommendation: truncateText(r['recommendation'], 140),
+    })),
+  };
+}
+
+function keyForItem(item: unknown, fields: string[]): string {
+  if (!item || typeof item !== 'object') return String(item);
+  const row = item as Record<string, unknown>;
+  return fields.map((f) => String(row[f] ?? '').toLowerCase().trim()).join('|');
+}
+
+function dedupePush(
+  target: unknown[],
+  items: unknown,
+  fields: string[],
+  max: number,
+): void {
+  if (!Array.isArray(items) || target.length >= max) return;
+  const seen = new Set(target.map((item) => keyForItem(item, fields)));
+  for (const item of items) {
+    if (target.length >= max) break;
+    const key = keyForItem(item, fields);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    target.push(item);
+  }
+}
+
+/** Programmatic fold of chunk findings — avoids LLM timeouts on large consolidations. */
+function foldExpertChunkAnalyses(analyses: Record<string, unknown>[]): ExpertReportAnalysis {
+  const observations: unknown[] = [];
+  const entities: unknown[] = [];
+  const apis: unknown[] = [];
+  const risks: unknown[] = [];
+  const recommendations: unknown[] = [];
+
+  for (const analysis of analyses) {
+    dedupePush(observations, analysis['observations'], ['area', 'finding'], 250);
+    dedupePush(entities, analysis['entities'], ['name'], 120);
+    dedupePush(apis, analysis['apis'], ['method', 'url'], 120);
+    dedupePush(risks, analysis['risks'], ['severity', 'risk'], 120);
+    dedupePush(recommendations, analysis['recommendations'], ['priority', 'recommendation'], 120);
+  }
+
+  return { observations, entities, apis, risks, recommendations };
+}
+
+async function synthesizeExpertAnalysisFromChunks(
+  chunkLlm: ReturnType<typeof createLLMClient>,
+  finalLlm: ReturnType<typeof createLLMClient>,
+  orderedAnalyses: ExpertReportAnalysis[],
+  meta: {
+    appName: string;
+    chunksProcessed: number;
+    completeEvidenceCharacters: number;
+    reportsDir: string;
+    finalModelLabel?: string;
+  },
+): Promise<ExpertReportAnalysis> {
+  const compact = orderedAnalyses.map(compactExpertChunkAnalysis);
+  const coverage = {
+    chunksProcessed: meta.chunksProcessed,
+    completeEvidenceCharacters: meta.completeEvidenceCharacters,
+  };
+
+  // Final merge uses primary LLM (OpenAI) + streaming — NVIDIA gateway kills ~5m idle/large gens.
+  const finalMerge = (analyses: unknown[], label: string) =>
+    retryUntilSuccess(
+      () =>
+        finalLlm.chatJson<ExpertReportAnalysis>(
+          [
+            {
+              role: 'system',
+              content:
+                'You are the final report synthesis orchestrator: chief software engineer, solution architect, data engineer, senior developer, product owner, security reviewer, integration architect, and domain expert. Consolidate the folded analyses into the requested enterprise report JSON. Cap each array at 12 items. Be concise. Return only valid JSON.',
+            },
+            {
+              role: 'user',
+              content: buildExpertReportAnalysisPrompt(
+                { foldedAnalyses: analyses, evidenceCoverage: coverage },
+                meta.appName,
+              ),
+            },
+          ],
+          { maxTokens: 12_000, stream: true },
+        ),
+      { label, delayMs: 10_000, maxDelayMs: 180_000, maxAttempts: 6 },
+    );
+
+  const batchMerge = (analyses: unknown[], label: string) =>
+    retryUntilSuccess(
+      () =>
+        chunkLlm.chatJson<ExpertReportAnalysis>(
+          [
+            {
+              role: 'system',
+              content:
+                'You consolidate reverse-engineering evidence chunk analyses. Deduplicate and return only valid JSON matching the requested schema. Keep findings concise.',
+            },
+            {
+              role: 'user',
+              content: buildExpertMergeBatchPrompt(analyses, meta.appName),
+            },
+          ],
+          { maxTokens: 6_000 },
+        ),
+      { label, delayMs: 8_000, maxDelayMs: 120_000, maxAttempts: 6 },
+    );
+
+  // Prefer a single programmatic fold + one final LLM call when possible.
+  const folded = foldExpertChunkAnalyses(compact);
+  const foldedPayload = JSON.stringify({ foldedAnalyses: [folded], evidenceCoverage: coverage });
+  if (foldedPayload.length <= EXPERT_FINAL_MERGE_MAX_CHARS) {
+    logger.info(
+      `Expert final synthesis: programmatic fold of ${compact.length} chunks → one LLM call` +
+        ` (${foldedPayload.length} chars, model=${meta.finalModelLabel ?? 'primary'})`,
+    );
+    writeJson(path.join(meta.reportsDir, 'expert-analysis-folded.json'), folded);
+    return finalMerge([folded], 'Expert final synthesis');
+  }
+
+  const batchSize = EXPERT_MERGE_BATCH_SIZE;
+  const totalBatches = Math.ceil(compact.length / batchSize);
+  logger.info(
+    `Expert final synthesis: hierarchical merge (${compact.length} chunks → ${totalBatches} slim batches of ≤${batchSize})`,
+  );
+
+  const batchSummaries: (ExpertReportAnalysis | null)[] = new Array(totalBatches).fill(null);
+  const pending: number[] = [];
+
+  for (let batchIndex = 1; batchIndex <= totalBatches; batchIndex++) {
+    const batchPath = path.join(
+      meta.reportsDir,
+      `expert-analysis-merge-batch-${String(batchIndex).padStart(3, '0')}.json`,
+    );
+    const cached = fileExists(batchPath) ? readJson<ExpertReportAnalysis>(batchPath) : null;
+    if (cached) {
+      logger.info(`Reusing expert merge batch ${batchIndex}/${totalBatches} from checkpoint`);
+      batchSummaries[batchIndex - 1] = cached;
+    } else {
+      pending.push(batchIndex);
+    }
+  }
+
+  let nextPending = 0;
+  const workers = Array.from(
+    { length: Math.min(EXPERT_MERGE_CONCURRENCY, Math.max(1, pending.length)) },
+    async () => {
+      while (true) {
+        const slot = nextPending++;
+        if (slot >= pending.length) break;
+        const batchIndex = pending[slot]!;
+        const start = (batchIndex - 1) * batchSize;
+        const batch = compact.slice(start, start + batchSize);
+        logger.info(`Expert merge batch ${batchIndex}/${totalBatches} (${batch.length} chunks)`);
+        const summary = await batchMerge(batch, `Expert merge batch ${batchIndex}/${totalBatches}`);
+        writeJson(
+          path.join(
+            meta.reportsDir,
+            `expert-analysis-merge-batch-${String(batchIndex).padStart(3, '0')}.json`,
+          ),
+          summary,
+        );
+        batchSummaries[batchIndex - 1] = summary;
+      }
+    },
+  );
+  await Promise.all(workers);
+
+  const completed = batchSummaries.filter((s): s is ExpertReportAnalysis => s !== null);
+  if (completed.length !== totalBatches) {
+    throw new Error(`Expert merge incomplete: ${completed.length}/${totalBatches} batches`);
+  }
+
+  const foldedBatches = foldExpertChunkAnalyses(completed.map(compactExpertChunkAnalysis));
+  writeJson(path.join(meta.reportsDir, 'expert-analysis-folded.json'), foldedBatches);
+  return finalMerge([foldedBatches], 'Expert final synthesis');
 }
 
 function collectSessionArtifactMeta(projectSlug: string, sourceSessionIds: string[]): Array<Record<string, unknown>> {
@@ -356,8 +574,9 @@ async function runExpertReportAnalysis(
   reportsDir: string,
   onChunkProgress?: (fraction: number, message?: string) => Promise<void> | void,
 ): Promise<ExpertReportAnalysis | null> {
-  // Expert uses SYNTHESIS_LLM_* again (NVIDIA).
+  // Chunk analysis: SYNTHESIS_LLM_* (NVIDIA). Final merge: primary LLM_* (OpenAI) — NVIDIA times out at ~5m.
   const expertLlmConfig = resolveSynthesisLlmConfig(ctx.llmConfig);
+  const finalLlmConfig = resolveExpertLlmConfig(ctx.llmConfig);
   if (!expertLlmConfig.apiKey && !isLLMConfigured(ctx.llmConfig)) return null;
 
   const existingFinal = path.join(reportsDir, 'expert-analysis.json');
@@ -416,8 +635,12 @@ async function runExpertReportAnalysis(
       })),
     });
     const llm = createLLMClient(expertLlmConfig);
+    const finalLlm = createLLMClient(finalLlmConfig);
     logger.info(
       `Expert report agent using model=${expertLlmConfig.model ?? 'default'} baseUrl=${expertLlmConfig.baseUrl ?? 'default (OpenAI)'}`,
+    );
+    logger.info(
+      `Expert final synthesis will use model=${finalLlmConfig.model ?? 'default'} baseUrl=${finalLlmConfig.baseUrl ?? 'default (OpenAI)'} (streamed)`,
     );
 
     const chunkAnalyses: (ExpertReportAnalysis | null)[] = new Array(chunks.length).fill(null);
@@ -460,7 +683,7 @@ async function runExpertReportAnalysis(
               {
                 role: 'system',
                 content:
-                  'You are an expert evidence extraction agent for enterprise reverse engineering. Analyze this raw evidence chunk without ignoring any included content. Return only valid JSON.',
+                  'You are an expert evidence extraction agent for enterprise reverse engineering. Analyze this raw evidence chunk without ignoring any included content. Return only valid JSON — no markdown fences, no duplicate opening braces, no preamble. Keep observations concise (max 25) so the full JSON object fits in the response.',
               },
               {
                 role: 'user',
@@ -481,7 +704,7 @@ Raw evidence chunk:
 ${chunks[i]}`,
               },
             ],
-            { maxTokens: 8_000 },
+            { maxTokens: 16_000 },
           ),
         { label: `Expert chunk ${i + 1}/${chunks.length}`, delayMs: 10_000, maxDelayMs: 180_000 },
       );
@@ -511,30 +734,13 @@ ${chunks[i]}`,
       throw new Error(`Expert analysis incomplete: ${orderedAnalyses.length}/${chunks.length} chunks`);
     }
 
-    const analysis = await retryUntilSuccess(
-      () =>
-        llm.chatJson<ExpertReportAnalysis>(
-          [
-            {
-              role: 'system',
-              content:
-                'You are the final report synthesis orchestrator: chief software engineer, solution architect, data engineer, senior developer, product owner, security reviewer, integration architect, and domain expert. Use every chunk analysis and return only valid JSON.',
-            },
-            {
-              role: 'user',
-              content: buildExpertReportAnalysisPrompt(
-                {
-                  chunkAnalyses: orderedAnalyses,
-                  evidenceCoverage: { chunksProcessed: chunks.length, completeEvidenceCharacters: evidenceText.length },
-                },
-                ctx.appName,
-              ),
-            },
-          ],
-          { maxTokens: 8_000 },
-        ),
-      { label: 'Expert final synthesis', delayMs: 10_000, maxDelayMs: 180_000 },
-    );
+    const analysis = await synthesizeExpertAnalysisFromChunks(llm, finalLlm, orderedAnalyses, {
+      appName: ctx.appName,
+      chunksProcessed: chunks.length,
+      completeEvidenceCharacters: evidenceText.length,
+      reportsDir,
+      finalModelLabel: `${finalLlmConfig.model ?? 'default'}@${finalLlmConfig.baseUrl ?? 'openai'}`,
+    });
 
     writeJson(path.join(reportsDir, 'expert-analysis.json'), analysis);
     return analysis;
@@ -1322,7 +1528,13 @@ export async function generateFullReport(
     await hooks.onStageStart?.('expert-analysis', 'Expert evidence analysis');
     expertAnalysis = await retryUntilSuccess(
       () => runExpertReportAnalysis(ctx, networkCallsTotal, reportsDir, hooks.onStageProgress),
-      { label: 'Expert report analysis stage', delayMs: 15_000, maxDelayMs: 180_000 },
+      {
+        label: 'Expert report analysis stage',
+        delayMs: 15_000,
+        maxDelayMs: 180_000,
+        maxAttempts: 4,
+        maxElapsedMs: 3 * 60 * 60_000,
+      },
     );
     await hooks.onStageComplete?.(
       'expert-analysis',

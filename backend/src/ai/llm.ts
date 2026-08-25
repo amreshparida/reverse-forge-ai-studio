@@ -47,7 +47,8 @@ export class LLMClient {
       baseURL: baseURL || undefined,
       apiKey: apiKey || 'placeholder', // some local providers (Ollama) don't need a key
       maxRetries: 0, // we handle retries ourselves
-      timeout: 300_000,
+      // Synthesis / merge prompts can be large; NVIDIA often needs >5m on heavy consolidations.
+      timeout: 600_000,
     });
   }
 
@@ -157,6 +158,89 @@ export class LLMClient {
   }
 }
 
+/** Strip markdown fences and fix common Nemotron / provider JSON prefix glitches. */
+function normalizeLlmJsonText(raw: string): string {
+  let text = raw.trim();
+  const codeBlock = text.match(/```(?:json)?\s*\n?([\s\S]+?)\n?```/);
+  if (codeBlock?.[1]) {
+    text = codeBlock[1].trim();
+  }
+
+  // `{ {` or `{\n{` duplicate opening brace
+  text = text.replace(/^\{\s*\{/, '{');
+
+  // Spurious `"{"` line after `{` (Nemotron sometimes emits `{ \n "{\n "chunk": ...`)
+  text = text.replace(/^\{\s*\n\s*"\{\s*\n\s*"/, '{\n  "');
+
+  return text;
+}
+
+/** Best-effort close for JSON truncated at max_completion_tokens. */
+function closeTruncatedJson(text: string): string {
+  let s = text.trimEnd();
+
+  // Drop trailing partial property / array entry
+  s = s.replace(/,\s*$/, '');
+  s = s.replace(/,\s*\{[^}]*$/, '');
+  s = s.replace(/,\s*\[[^\]]*$/, '');
+  s = s.replace(/,\s*"[^"]*$/, '');
+  s = s.replace(/:\s*"[^"]*$/, ': ""');
+  s = s.replace(/:\s*$/, ': null');
+
+  const stack: Array<'{' | '['> = [];
+  let inString = false;
+  let escape = false;
+
+  for (const ch of s) {
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === '{') stack.push('{');
+    else if (ch === '[') stack.push('[');
+    else if (ch === '}' && stack.at(-1) === '{') stack.pop();
+    else if (ch === ']' && stack.at(-1) === '[') stack.pop();
+  }
+
+  if (inString) s += '"';
+
+  while (stack.length > 0) {
+    s += stack.pop() === '{' ? '}' : ']';
+  }
+
+  return s;
+}
+
+function tryParseJsonCandidate<T>(candidate: string, salvaged: boolean): T | null {
+  try {
+    return JSON.parse(candidate) as T;
+  } catch {
+    if (salvaged) return null;
+    try {
+      const repaired = closeTruncatedJson(candidate);
+      if (repaired !== candidate) {
+        logger.debug('Salvaged truncated JSON from LLM response', {
+          originalChars: candidate.length,
+          repairedChars: repaired.length,
+        });
+        return JSON.parse(repaired) as T;
+      }
+    } catch {
+      // fall through
+    }
+    return null;
+  }
+}
+
 /** Extract and parse JSON from an LLM response, handling markdown code blocks */
 function parseJsonFromLLM<T>(raw: string): T {
   const trimmed = (raw ?? '').trim();
@@ -164,38 +248,21 @@ function parseJsonFromLLM<T>(raw: string): T {
     throw new Error('Failed to parse JSON from LLM response: empty content (model may have exhausted max tokens on reasoning)');
   }
 
-  // Direct JSON — also tolerate `{ {` double-brace malformation from some providers
-  const normalized = trimmed.replace(/^\{\s*\{/, '{');
-  if (normalized.startsWith('{') || normalized.startsWith('[')) {
-    try {
-      return JSON.parse(normalized) as T;
-    } catch {
-      // fall through
-    }
+  const candidates = [
+    normalizeLlmJsonText(trimmed),
+    trimmed.replace(/^\{\s*\{/, '{'),
+    trimmed,
+  ];
+
+  for (const candidate of [...new Set(candidates)]) {
+    if (!candidate.startsWith('{') && !candidate.startsWith('[')) continue;
+    const parsed = tryParseJsonCandidate<T>(candidate, false);
+    if (parsed !== null) return parsed;
   }
 
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    try {
-      return JSON.parse(trimmed) as T;
-    } catch {
-      // fall through
-    }
-  }
-
-  // Wrapped in ```json ... ``` or ``` ... ```
-  const codeBlock = trimmed.match(/```(?:json)?\s*\n?([\s\S]+?)\n?```/);
-  if (codeBlock?.[1]) {
-    return JSON.parse(codeBlock[1].trim()) as T;
-  }
-
-  // Last resort: try parsing anyway
-  try {
-    return JSON.parse(trimmed) as T;
-  } catch {
-    throw new Error(
-      `Failed to parse JSON from LLM response. First 300 chars: ${trimmed.slice(0, 300)}`,
-    );
-  }
+  throw new Error(
+    `Failed to parse JSON from LLM response. First 300 chars: ${trimmed.slice(0, 300)}`,
+  );
 }
 
 export function createLLMClient(cfg?: LLMConfig): LLMClient {

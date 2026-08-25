@@ -209,4 +209,51 @@ describe('LLM service', () => {
       client.chatJson([{ role: 'user', content: 'Pick action' }]),
     ).rejects.toThrow('Failed to parse JSON from LLM response');
   });
+
+  it('repairs Nemotron-style duplicate brace prefixes in chatJson', async () => {
+    mocks.create.mockResolvedValueOnce({
+      model: 'nvidia/nemotron',
+      choices: [{ message: { content: '{\n{"chunk": 831, "observations": []}' } }],
+    });
+
+    const client = new LLMClient({ apiKey: 'key', model: 'nvidia/nemotron' });
+    const parsed = await client.chatJson<{ chunk: number; observations: unknown[] }>(
+      [{ role: 'user', content: 'Analyze chunk' }],
+    );
+
+    expect(parsed).toEqual({ chunk: 831, observations: [] });
+  });
+
+  it('repairs Nemotron spurious "{\\" line prefixes in chatJson', async () => {
+    mocks.create.mockResolvedValueOnce({
+      model: 'nvidia/nemotron',
+      choices: [{ message: { content: '{\n  "{\n  "chunk": 831, "observations": []}' } }],
+    });
+
+    const client = new LLMClient({ apiKey: 'key', model: 'nvidia/nemotron' });
+    const parsed = await client.chatJson<{ chunk: number; observations: unknown[] }>(
+      [{ role: 'user', content: 'Analyze chunk' }],
+    );
+
+    expect(parsed).toEqual({ chunk: 831, observations: [] });
+  });
+
+  it('salvages truncated JSON objects from chatJson', async () => {
+    mocks.create.mockResolvedValueOnce({
+      model: 'nvidia/nemotron',
+      choices: [{
+        message: {
+          content: '{"chunk": 831, "observations": [{"area": "security", "finding": "RBAC matrix"',
+        },
+      }],
+    });
+
+    const client = new LLMClient({ apiKey: 'key', model: 'nvidia/nemotron' });
+    const parsed = await client.chatJson<{ chunk: number; observations: Array<{ area: string }> }>(
+      [{ role: 'user', content: 'Analyze chunk' }],
+    );
+
+    expect(parsed.chunk).toBe(831);
+    expect(parsed.observations[0]?.area).toBe('security');
+  });
 });
